@@ -1,0 +1,11 @@
+[project]
+name = "rocmforge"
+version = "0.1.0"
+description = "Proof-backed multi-agent migration lab for CUDA to AMD/ROCm compatibility."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

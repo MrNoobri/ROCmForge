@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Environment / secrets — NEVER COMMIT THESE
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+*_rsa
+*_ed25519
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# RAG / model artifacts
+.chroma/
+*.sqlite3
+*.bin
+*.safetensors
+models/
+
+# Run outputs (keep the dir, ignore contents)
+outputs/*
+!outputs/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Build / dist
+build/
+dist/
+*.tar.gz
+
+# AMD/ROCm runtime artifacts that some scripts dump
+core_dump_*
+hsakmt.log
+
+# Demo cached run JSON is COMMITTED — do NOT ignore examples/cached_runs/

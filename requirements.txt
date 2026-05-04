@@ -1,0 +1,10 @@
+streamlit
+crewai
+openai
+chromadb
+sentence-transformers
+plotly
+python-dotenv
+pydantic
+gitpython
+paramiko

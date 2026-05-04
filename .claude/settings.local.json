@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.amd.com)",
+      "WebFetch(domain:lablab.ai)"
+    ]
+  }
+}
