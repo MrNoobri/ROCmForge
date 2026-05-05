@@ -3,7 +3,8 @@
     "allow": [
       "WebSearch",
       "WebFetch(domain:www.amd.com)",
-      "WebFetch(domain:lablab.ai)"
+      "WebFetch(domain:lablab.ai)",
+      "PowerShell($root = \"c:\\\\Users\\\\noobr\\\\Documents\\\\vscode\\\\ROCmForge\"; Get-ChildItem -Path $root -Recurse -Force -Exclude \".git\" | Select-Object @{Name=\"RelativePath\"; Expression={$_.FullName.Replace\\($root, \"\"\\).TrimStart\\(\"\\\\\"\\)}}, @{Name=\"Type\"; Expression={if\\($_.PSIsContainer\\) {\"[DIR]\"} else {\"[FILE]\"}}}, Length | Sort-Object RelativePath | Out-String -Width 200)"
     ]
   }
 }
