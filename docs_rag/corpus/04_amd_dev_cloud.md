@@ -99,7 +99,7 @@ AMD offers an initial 25 hours of complimentary cloud credit to qualified develo
 - Credits apply only to MI300X GPUs, not storage or backups.
 - Powering off a VM still incurs charges for reserved resources.
 - To maximize free credits, destroy the VM when done.
-- To pause work, create a snapshot and later create a new VM from it. See [DigitalOcean snapshot pricing](https://docs.digitalocean.com/products/snapshots/details/pricing/#:~:text=Snapshots%20are%20charged%20at%20%240.06,the%20size%20of%20the%20snapshot.) for details.
+- To pause work, create a snapshot and later create a new VM from it.
 
 ## Conclusion
 

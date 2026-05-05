@@ -33,7 +33,7 @@ When working at the bare-metal or container level, your muscle memory will need 
 The most pleasant surprise for developers migrating to ROCm is how little Python code actually needs to change.
 
 *   **The `.to("cuda")` Illusion:** PyTorch developers explicitly preserve API compatibility. **Do not change your `.to("cuda")` calls.** Under the hood, the PyTorch ROCm build aliases the `cuda` device to the HIP backend. Calling `model.to("cuda")` or `x.cuda()` will seamlessly route your tensors to the AMD GPU. 
-*   **JAX Compatibility:** Similarly, JAX abstracts the hardware. Once you install JAX with the ROCm plugin (`pip install jax[rocm] -f [https://repo.radeon.com/rocm/manylinux/rocm-rel-X.Y/](https://repo.radeon.com/rocm/manylinux/rocm-rel-X.Y/)`), `jax.devices()` will recognize the AMD GPUs, and `jax.numpy` operations run natively without code changes.
+*   **JAX Compatibility:** Similarly, JAX abstracts the hardware. Once you install JAX with the ROCm plugin (`pip install jax[rocm] -f https://repo.radeon.com/rocm/manylinux/rocm-rel-X.Y/`), `jax.devices()` will recognize the AMD GPUs, and `jax.numpy` operations run natively without code changes.
 *   **When Explicit Variables are Required:** You only need to touch explicit HIP variables when dealing with memory allocation or compiling custom C++ extensions. For instance, configuring the memory allocator might require `PYTORCH_HIP_ALLOC_CONF` instead of `PYTORCH_CUDA_ALLOC_CONF`.
 
 ---
