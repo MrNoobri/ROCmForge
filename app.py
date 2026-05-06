@@ -2,6 +2,10 @@ def main() -> None:
     """Launch the Streamlit shell for the ROCmForge migration dashboard."""
     import streamlit as st
     import plotly.graph_objects as go
+    import tempfile
+
+    import agents
+    from core.repo_loader import load_repo_from_url
 
     st.set_page_config(page_title="ROCmForge", layout="wide")
 
@@ -21,103 +25,82 @@ def main() -> None:
         )
         start_migration = st.button("Start Migration", type="primary")
 
-    mock_results = {
-        "readiness_score": 38,
-        "issues": [
-            {
-                "severity": "high",
-                "file": "Dockerfile",
-                "line": 1,
-                "description": "Base image uses NVIDIA CUDA runtime.",
-            },
-            {
-                "severity": "high",
-                "file": "requirements.txt",
-                "line": 3,
-                "description": "CUDA-only dependency: bitsandbytes.",
-            },
-            {
-                "severity": "medium",
-                "file": "app.py",
-                "line": 14,
-                "description": "Detected torch.cuda.set_device usage.",
-            },
-            {
-                "severity": "medium",
-                "file": "app.py",
-                "line": 22,
-                "description": "Detected .cuda() call on model/tensor.",
-            },
-            {
-                "severity": "low",
-                "file": "README.md",
-                "line": 5,
-                "description": "README references NVIDIA CUDA Toolkit.",
-            },
-        ],
-        "patch_text": """diff --git a/Dockerfile b/Dockerfile.rocm
-index 8e3f0aa..d7b1b77 100644
---- a/Dockerfile
-+++ b/Dockerfile.rocm
-@@ -1,6 +1,7 @@
--FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
-+FROM rocm/pytorch:rocm6.0_ubuntu22.04_py3.11_pytorch
- WORKDIR /app
- COPY . /app
- RUN pip install -r requirements.txt
-+RUN python -c \"import torch; print(torch.version.hip)\"
- CMD [\"python\", \"app.py\"]
-""",
-        "generated_files": ["Dockerfile.rocm", "rocm_setup.md"],
-        "agent_timeline": [
-            {"name": "Code Analyzer", "state": "complete"},
-            {"name": "ROCm Knowledge", "state": "complete"},
-            {"name": "Migration Engineer", "state": "complete"},
-            {"name": "QA Tester", "state": "running"},
-            {"name": "Benchmark", "state": "pending"},
-            {"name": "Report", "state": "pending"},
-        ],
-        "amd_logs": """[qa] starting validation
-[qa] parsed app.py ok
-[qa] sandbox run queued
-[qa] waiting for GPU availability...
-""",
-        "benchmark": {
-            "before": {"status": "failed", "runtime": None, "memory": None},
-            "after": {"status": "passed", "runtime": 8.4, "memory": 6.2},
-        },
-        "report_markdown": """
-# ROCmForge Migration Report
-
-## Summary
-The scan detected CUDA-specific dependencies and usage patterns that prevent
-execution on AMD GPUs. A ROCm-compatible base image and dependency replacements
-were proposed, and the project was validated with a mocked AMD sandbox run.
-
-## Key Findings
-- Dockerfile uses an NVIDIA CUDA base image.
-- bitsandbytes is CUDA-only and must be replaced.
-- Direct CUDA calls (.cuda, torch.cuda.set_device) are present.
-
-## Recommendations
-1. Switch to ROCm base images for container builds.
-2. Replace bitsandbytes with Optimum-AMD or native PyTorch modules.
-3. Validate on AMD hardware with ROCm and PyTorch ROCm builds.
-
-## Next Steps
-Run the patched project on an AMD MI300X sandbox to confirm performance
-and update the README with ROCm installation steps.
-""",
-    }
+    agent_names = [
+        "Code Analyzer",
+        "ROCm Knowledge",
+        "Migration Engineer",
+        "QA Tester",
+        "Benchmark",
+        "Report",
+    ]
 
     if "results" not in st.session_state:
         st.session_state.results = None
 
     if start_migration:
-        st.session_state.results = {
-            **mock_results,
-            "input": {"pasted_script": pasted_script, "github_url": github_url},
+        st.session_state.results = None
+        status_container = st.container()
+        status_blocks = {
+            name: status_container.status(name, state="running", expanded=False)
+            for name in agent_names
         }
+        temp_dir = None
+        repo_temp_dir = None
+        try:
+            if not pasted_script.strip() and not github_url.strip():
+                raise ValueError("Provide a script or a repository URL to scan.")
+
+            if pasted_script.strip():
+                temp_dir = tempfile.TemporaryDirectory(prefix="rocmforge_")
+                temp_path = f"{temp_dir.name}/app.py"
+                with open(temp_path, "w", encoding="utf-8") as handle:
+                    handle.write(pasted_script)
+                input_path = temp_path
+            else:
+                input_path, repo_temp_dir = load_repo_from_url(github_url.strip())
+
+            with st.spinner("Running migration agents..."):
+                migration_results = agents.run_migration(input_path)
+
+            for name in agent_names:
+                status_blocks[name].update(state="complete")
+
+            generated_files = migration_results.get("generated_files", {})
+            generated_list = (
+                sorted(generated_files)
+                if isinstance(generated_files, dict)
+                else list(generated_files)
+            )
+            qa_result = migration_results.get("qa_result", {})
+            st.session_state.results = {
+                "readiness_score": migration_results.get("score_before", 0),
+                "issues": migration_results.get("issues", []),
+                "patch_text": migration_results.get("patch_text", ""),
+                "generated_files": generated_list,
+                "agent_timeline": [
+                    {"name": name, "state": "complete"}
+                    for name in agent_names
+                ],
+                "amd_logs": qa_result.get("logs", ""),
+                "benchmark": {
+                    "before": {"status": "failed", "runtime": None, "memory": None},
+                    "after": {
+                        "status": qa_result.get("status", "unknown"),
+                        "runtime": qa_result.get("runtime_sec", 0.0),
+                        "memory": qa_result.get("gpu_memory_gb", 0.0),
+                    },
+                },
+                "report_markdown": migration_results.get("report_markdown", ""),
+                "input": {"pasted_script": pasted_script, "github_url": github_url},
+            }
+        except Exception as exc:
+            status_blocks[agent_names[0]].update(state="error")
+            st.error(str(exc))
+        finally:
+            if temp_dir is not None:
+                temp_dir.cleanup()
+            if repo_temp_dir is not None:
+                repo_temp_dir.cleanup()
 
     results = st.session_state.results
     tabs = st.tabs(
