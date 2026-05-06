@@ -18,8 +18,12 @@ def _read_source_files(input_path: str) -> dict[str, str]:
     """Read all scannable files from input_path into {filename: content}."""
     base = Path(input_path)
     source_files: dict[str, str] = {}
+
+    def _source_key(file_path: Path, root_path: Path) -> str:
+        return file_path.relative_to(root_path).as_posix()
+
     if base.is_file():
-        source_files[base.name] = base.read_text(encoding="utf-8", errors="ignore")
+        source_files[_source_key(base, base.parent)] = base.read_text(encoding="utf-8", errors="ignore")
         return source_files
     for f in base.rglob("*"):
         if not f.is_file():
@@ -31,7 +35,7 @@ def _read_source_files(input_path: str) -> dict[str, str]:
             or name_lower.startswith("readme")
         ):
             try:
-                source_files[f.name] = f.read_text(encoding="utf-8", errors="ignore")
+                source_files[_source_key(f, base)] = f.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 pass
     return source_files

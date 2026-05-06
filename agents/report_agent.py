@@ -26,12 +26,15 @@ def build_report(
 ) -> str:
     """Build and save the migration report. Returns the markdown string."""
 
+    def _escape_cell(value: object) -> str:
+        return str(value).replace("|", r"\|")
+
     # Issues table
     if issues:
         header = "| File | Line | Severity | Pattern | Description |\n|---|---|---|---|---|"
         rows = "\n".join(
-            f"| {i.get('file','?')} | {i.get('line','?')} | {i.get('severity','?')} "
-            f"| {i.get('pattern_id','?')} | {i.get('description','?')} |"
+            f"| {_escape_cell(i.get('file','?'))} | {_escape_cell(i.get('line','?'))} | {_escape_cell(i.get('severity','?'))} "
+            f"| {_escape_cell(i.get('pattern_id','?'))} | {_escape_cell(i.get('description','?'))} |"
             for i in issues
         )
         issues_table = f"{header}\n{rows}"

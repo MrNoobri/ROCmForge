@@ -1,7 +1,6 @@
 """QA agent — syntax-checks the migrated code (mocked AMD run for Phase 6)."""
 
-import subprocess
-import sys
+import ast
 from pathlib import Path
 
 from crewai import Agent
@@ -33,22 +32,19 @@ def run_qa(patched_dir: str) -> dict:
             }
         target = py_files[0]
 
-    result = subprocess.run(
-        [sys.executable, "-c", f"import ast; ast.parse(open({str(target)!r}).read())"],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode == 0:
+    try:
+        ast.parse(target.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, SyntaxError) as exc:
         return {
-            "status": "passed",
-            "logs": "Syntax check passed.",
-            "runtime_sec": 8.4,
-            "gpu_memory_gb": 6.2,
+            "status": "failed",
+            "logs": str(exc),
+            "runtime_sec": 0.0,
+            "gpu_memory_gb": 0.0,
         }
+
     return {
-        "status": "failed",
-        "logs": result.stderr or result.stdout or "Unknown error",
-        "runtime_sec": 0.0,
-        "gpu_memory_gb": 0.0,
+        "status": "passed",
+        "logs": "Syntax check passed.",
+        "runtime_sec": 8.4,
+        "gpu_memory_gb": 6.2,
     }
