@@ -7,7 +7,7 @@ from docs_rag.retriever import retrieve
 
 def _build_llm() -> LLM:
     return LLM(
-        model="openai/Qwen/Qwen2.5-Coder-7B-Instruct",
+        model="openai/Qwen/Qwen2.5-1.5B-Instruct",
         base_url=os.environ.get("VLLM_ENDPOINT_URL"),
         api_key=os.environ.get("VLLM_API_KEY"),
     )
