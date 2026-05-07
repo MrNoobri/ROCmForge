@@ -68,12 +68,32 @@ def run_migration_agent(issues_json: str, source_files: dict[str, str]) -> dict:
 
 
 def _build_llm() -> LLM:
-    endpoint = os.environ.get("VLLM_ENDPOINT_URL", "").strip()
-    api_key = os.environ.get("VLLM_API_KEY", "").strip()
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    endpoint = _get_config("VLLM_ENDPOINT_URL")
+    api_key = _get_config("VLLM_API_KEY")
     if not endpoint or not api_key:
         raise RuntimeError("VLLM_ENDPOINT_URL and VLLM_API_KEY must be set.")
-    model_name = _normalize_model_name(os.environ.get("VLLM_MODEL", MODEL_NAME).strip())
+    model_name = _normalize_model_name(_get_config("VLLM_MODEL", MODEL_NAME))
     return LLM(model=model_name, base_url=endpoint, api_key=api_key)
+
+
+def _get_config(key: str, default: str = "") -> str:
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+
+        return str(st.secrets.get(key, default)).strip()
+    except Exception:
+        return default
 
 
 def _build_agent(llm: LLM) -> Agent:

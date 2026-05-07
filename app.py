@@ -5,7 +5,7 @@ def main() -> None:
     import tempfile
 
     import agents
-    from core.repo_loader import load_repo_from_url
+    from core.repo_loader import cleanup_temp, load_repo_from_url
 
     st.set_page_config(page_title="ROCmForge", layout="wide")
 
@@ -100,7 +100,7 @@ def main() -> None:
             if temp_dir is not None:
                 temp_dir.cleanup()
             if repo_temp_dir is not None:
-                repo_temp_dir.cleanup()
+                cleanup_temp(repo_temp_dir)
 
     results = st.session_state.results
     tabs = st.tabs(

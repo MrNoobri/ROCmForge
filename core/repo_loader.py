@@ -29,6 +29,12 @@ def load_repo(input_path_or_url: str) -> str:
     return str(path.resolve())
 
 
+def load_repo_from_url(url: str) -> tuple[str, str]:
+    """Load a GitHub URL and return (input_path, temp_path) for app.py cleanup."""
+    path = load_repo(url)
+    return path, path
+
+
 def _is_github_url(value: str) -> bool:
     try:
         parsed = urlparse(value)
