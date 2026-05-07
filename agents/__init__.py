@@ -3,7 +3,20 @@
 import dataclasses
 import json
 import os
+import tempfile
 from pathlib import Path
+
+if os.name == "nt":
+    os.environ["LOCALAPPDATA"] = tempfile.gettempdir()
+
+try:
+    import appdirs
+
+    appdirs.user_data_dir = lambda appname=None, *_, **__: str(
+        Path(tempfile.gettempdir()) / "CrewAI" / str(appname or "ROCmForge")
+    )
+except ImportError:
+    pass
 
 from core.pattern_scanner import scan
 from core.scoring import score_before, score_after
