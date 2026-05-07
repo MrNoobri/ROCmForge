@@ -1,5 +1,6 @@
 streamlit
 crewai
+litellm
 openai
 chromadb
 sentence-transformers
@@ -8,3 +9,4 @@ python-dotenv
 pydantic
 gitpython
 paramiko
+litellm
