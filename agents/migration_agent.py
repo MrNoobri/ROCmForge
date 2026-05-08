@@ -59,6 +59,7 @@ def run_migration_agent(
         migration = _fallback_migration(issues, source_files)
     else:
         migration = _merge_extras(parsed, extra_new_files, extra_commentary)
+    migration = _ensure_required_edits(migration, issues, source_files)
 
     source_dir = _materialize_source_files(source_files)
     patch_result = apply_edits(migration, source_dir)
@@ -355,6 +356,172 @@ def _fallback_migration(issues: list[dict], source_files: dict[str, str]) -> Mig
         new_files=extra_files,
         commentary="\n\n".join(commentary),
     )
+
+
+def _ensure_required_edits(
+    migration: MigrationOutput,
+    issues: list[dict],
+    source_files: dict[str, str],
+) -> MigrationOutput:
+    """Add deterministic fixes for known hard failures the LLM may miss."""
+    edits = list(migration.edits)
+    commentary = migration.commentary
+    needs_bitsandbytes_fix = any(
+        issue.get("pattern_id") in {"import_bitsandbytes", "dep_cuda_only"}
+        and "bitsandbytes" in str(issue.get("snippet", "")).lower()
+        for issue in issues
+    )
+
+    if needs_bitsandbytes_fix:
+        for filename, content in source_files.items():
+            if not filename.lower().endswith(".py"):
+                continue
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped == "import bitsandbytes" or stripped.startswith("import bitsandbytes as "):
+                    _append_unique_edit(
+                        edits,
+                        Edit(
+                            file=filename,
+                            original_block=line,
+                            replacement_block=f"# Removed CUDA-only bitsandbytes import for ROCm review: {stripped}",
+                            rationale="Prevent runtime failure on ROCm where bitsandbytes is unavailable or CUDA-specific.",
+                        ),
+                    )
+                elif stripped.startswith("from bitsandbytes import "):
+                    _append_unique_edit(
+                        edits,
+                        Edit(
+                            file=filename,
+                            original_block=line,
+                            replacement_block=f"# Removed CUDA-only bitsandbytes import for ROCm review: {stripped}",
+                            rationale="Prevent runtime failure on ROCm where bitsandbytes is unavailable or CUDA-specific.",
+                        ),
+                    )
+
+    for filename, content in source_files.items():
+        if not filename.lower().endswith(".py"):
+            continue
+
+        needs_device = False
+        has_device = re.search(r"^\s*device\s*=", content, flags=re.MULTILINE) is not None
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            indent = line[: len(line) - len(line.lstrip())]
+
+            if stripped == 'os.environ["CUDA_HOME"] = "/usr/local/cuda"' or stripped.startswith('os.environ["CUDA_HOME"]'):
+                _append_unique_edit(
+                    edits,
+                    Edit(
+                        file=filename,
+                        original_block=line,
+                        replacement_block=f"{indent}# Removed CUDA_HOME override for ROCm portability: {stripped}",
+                        rationale="Avoid forcing CUDA toolkit paths in ROCm environments.",
+                    ),
+                )
+
+            if stripped.startswith("torch.cuda.set_device("):
+                _append_unique_edit(
+                    edits,
+                    Edit(
+                        file=filename,
+                        original_block=line,
+                        replacement_block=f'{indent}device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+                        rationale="Replace hardcoded CUDA device selection with portable device detection.",
+                    ),
+                )
+                has_device = True
+
+            if re.search(r"\bload_in_(?:4bit|8bit)\s*=\s*True\b", stripped):
+                if stripped.startswith(("load_in_4bit", "load_in_8bit")):
+                    replacement_block = f"{indent}# Removed bitsandbytes quantization for ROCm review: {stripped}"
+                else:
+                    replacement_block = _remove_hf_bnb_quantization(line)
+                    replacement_block = re.sub(
+                        r"\bdevice_map\s*=\s*['\"]cuda['\"]",
+                        'device_map="auto"',
+                        replacement_block,
+                    )
+                _append_unique_edit(
+                    edits,
+                    Edit(
+                        file=filename,
+                        original_block=line,
+                        replacement_block=replacement_block,
+                        rationale="Remove Hugging Face bitsandbytes quantization because it requires CUDA-specific bitsandbytes.",
+                    ),
+                )
+
+            if re.search(r"\bdevice_map\s*=\s*['\"]cuda['\"]", stripped):
+                _append_unique_edit(
+                    edits,
+                    Edit(
+                        file=filename,
+                        original_block=line,
+                        replacement_block=f'{indent}device_map="auto",',
+                        rationale='Avoid pinning Hugging Face model loading to "cuda".',
+                    ),
+                )
+
+            if ".cuda()" in line and "torch.cuda." not in line:
+                replacement = line.replace(".cuda()", ".to(device)")
+                if replacement != line:
+                    needs_device = True
+                    _append_unique_edit(
+                        edits,
+                        Edit(
+                            file=filename,
+                            original_block=line,
+                            replacement_block=replacement,
+                            rationale="Replace direct .cuda() calls with device-aware .to(device).",
+                        ),
+                    )
+
+        if needs_device and not has_device and "import torch" in content:
+            _append_unique_edit(
+                edits,
+                Edit(
+                    file=filename,
+                    original_block="import torch",
+                    replacement_block='import torch\n\ndevice = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+                    rationale="Define a portable torch device for migrated tensor and model moves.",
+                ),
+            )
+
+    if any(issue.get("pattern_id") == "hf_bitsandbytes_quant" for issue in issues):
+        note = (
+            "Removed Hugging Face load_in_4bit/load_in_8bit flags because they invoke "
+            "bitsandbytes quantization. On ROCm, use Optimum-AMD, AutoGPTQ, or serve "
+            "the model with vLLM instead."
+        )
+        if note not in commentary:
+            commentary = (commentary + "\n\n" if commentary else "") + note
+
+    if needs_bitsandbytes_fix:
+        note = (
+            "Removed Python bitsandbytes imports when detected so AMD QA can run; "
+            "code paths that actively call bitsandbytes APIs still require an Optimum-AMD "
+            "or AutoGPTQ replacement."
+        )
+        if note not in commentary:
+            commentary = (commentary + "\n\n" if commentary else "") + note
+
+    return MigrationOutput(edits=edits, new_files=migration.new_files, commentary=commentary)
+
+
+def _append_unique_edit(edits: list[Edit], edit: Edit) -> None:
+    for existing in edits:
+        if existing.file == edit.file and existing.original_block == edit.original_block:
+            return
+    edits.append(edit)
+
+
+def _remove_hf_bnb_quantization(line: str) -> str:
+    updated = re.sub(r",\s*load_in_(?:4bit|8bit)\s*=\s*True\s*,\s*", ", ", line)
+    updated = re.sub(r",\s*load_in_(?:4bit|8bit)\s*=\s*True", "", updated)
+    updated = re.sub(r"load_in_(?:4bit|8bit)\s*=\s*True\s*,\s*", "", updated)
+    return updated
 
 
 def _materialize_source_files(source_files: dict[str, str]) -> str:

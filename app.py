@@ -78,7 +78,8 @@ def main() -> None:
 
     if start_migration:
         st.session_state.results = None
-        status_container = st.container()
+        run_status_placeholder = st.empty()
+        status_container = run_status_placeholder.container()
         status_blocks = {
             name: status_container.status(
                 name,
@@ -123,6 +124,7 @@ def main() -> None:
             )
             for step in agent_timeline:
                 status_blocks[step["name"]].update(state=step["state"])
+            run_status_placeholder.empty()
 
             st.session_state.results = {
                 "readiness_score": migration_results.get("score_before", 0),
@@ -263,11 +265,9 @@ def main() -> None:
     with tabs[4]:
         st.subheader("AMD Test")
         if results:
-            status_blocks = []
-            for step in results["agent_timeline"]:
-                status_blocks.append(
-                    st.status(step["name"], state=step["state"], expanded=False)
-                )
+            qa_status = results.get("benchmark", {}).get("after", {}).get("status", "unknown")
+            runtime = results.get("benchmark", {}).get("after", {}).get("runtime", 0.0)
+            st.metric("AMD sandbox result", qa_status, f"{runtime}s")
             st.text_area("Logs", value=results["amd_logs"], height=200)
             attempts = results.get("attempts", [])
             if attempts:

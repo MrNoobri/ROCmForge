@@ -2,15 +2,15 @@
 
 Doctests:
 >>> from core.pattern_scanner import _scan_text
->>> issues = _scan_text("import bitsandbytes\n", "main.py")
+>>> issues = _scan_text("import bitsandbytes\\n", "main.py")
 >>> [(i.pattern_id, i.severity) for i in issues]
-[("import_bitsandbytes", "high")]
+[('import_bitsandbytes', 'high')]
 
->>> issues = _scan_text("model.cuda()\n", "model.py")
+>>> issues = _scan_text("model.cuda()\\n", "model.py")
 >>> issues[0].pattern_id
 'pytorch_cuda_method'
 
->>> issues = _scan_text("FROM nvidia/cuda:12.1.0\n", "Dockerfile")
+>>> issues = _scan_text("FROM nvidia/cuda:12.1.0\\n", "Dockerfile")
 >>> issues[0].pattern_id
 'docker_nvidia_base'
 """
@@ -45,6 +45,8 @@ _NVCC_RE = re.compile(r"\bnvcc\b", re.IGNORECASE)
 _CUDA_HOME_RE = re.compile(r"CUDA_HOME")
 _README_CUDA_RE = re.compile(r"nvidia-smi|CUDA Toolkit", re.IGNORECASE)
 _TORCH_SET_DEVICE_RE = re.compile(r"torch\.cuda\.set_device\(")
+_HF_BNB_QUANT_RE = re.compile(r"\bload_in_(?:4bit|8bit)\s*=\s*True\b")
+_DEVICE_MAP_CUDA_RE = re.compile(r"\bdevice_map\s*=\s*['\"]cuda['\"]")
 
 
 def scan(path: str) -> list[Issue]:
@@ -174,6 +176,18 @@ def _scan_text(content: str, filename: str, *, full_path: str | None = None) -> 
             "medium",
             "hardcoded_gpu",
             "Hardcoded torch.cuda.set_device usage found.",
+        )
+        scan_regex(
+            _HF_BNB_QUANT_RE,
+            "high",
+            "hf_bitsandbytes_quant",
+            "Hugging Face model load uses bitsandbytes quantization.",
+        )
+        scan_regex(
+            _DEVICE_MAP_CUDA_RE,
+            "medium",
+            "hf_device_map_cuda",
+            'Hugging Face device_map is pinned to "cuda".',
         )
 
     return issues
