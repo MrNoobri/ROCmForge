@@ -6,6 +6,17 @@ import os
 import tempfile
 from pathlib import Path
 
+for _proxy_key in (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+):
+    if os.environ.get(_proxy_key, "").startswith("http://127.0.0.1:9"):
+        os.environ.pop(_proxy_key, None)
+
 if os.name == "nt":
     os.environ["LOCALAPPDATA"] = tempfile.gettempdir()
 

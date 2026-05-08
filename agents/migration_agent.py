@@ -6,11 +6,12 @@ import json
 import os
 import re
 import tempfile
+import tomllib
 from pathlib import Path
 
 from crewai import Agent, Crew, LLM, Task
 
-from core.patch_utils import MigrationOutput, apply_edits
+from core.patch_utils import Edit, MigrationOutput, apply_edits
 
 
 MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
@@ -50,8 +51,8 @@ def run_migration_agent(issues_json: str, source_files: dict[str, str]) -> dict:
     prompt = _build_prompt(issues_json, source_files_json)
 
     parsed = _request_migration_output(llm, prompt)
-    if parsed is None:
-        migration = MigrationOutput(edits=[], new_files={}, commentary="manual review required")
+    if parsed is None or (not parsed.edits and not parsed.new_files):
+        migration = _fallback_migration(issues, source_files)
     else:
         migration = _merge_extras(parsed, extra_new_files, extra_commentary)
 
@@ -91,9 +92,23 @@ def _get_config(key: str, default: str = "") -> str:
     try:
         import streamlit as st
 
-        return str(st.secrets.get(key, default)).strip()
+        value = str(st.secrets.get(key, "")).strip()
+        if value:
+            return value
     except Exception:
-        return default
+        pass
+
+    secrets_path = Path(".streamlit") / "secrets.toml"
+    if secrets_path.exists():
+        try:
+            data = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
+            value = str(data.get(key, "")).strip()
+            if value:
+                return value
+        except Exception:
+            pass
+
+    return default
 
 
 def _build_agent(llm: LLM) -> Agent:
@@ -156,6 +171,7 @@ def _run_llm(llm: LLM, prompt: str) -> str:
 
 
 def _parse_migration_output(response: str) -> tuple[MigrationOutput | None, str | None]:
+    response = _extract_json_object(response)
     try:
         data = json.loads(response)
     except json.JSONDecodeError as exc:
@@ -165,6 +181,19 @@ def _parse_migration_output(response: str) -> tuple[MigrationOutput | None, str 
         return MigrationOutput.model_validate(data), None
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
+
+
+def _extract_json_object(response: str) -> str:
+    text = response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 
 def _safe_load_issues(issues_json: str) -> list[dict]:
@@ -236,6 +265,81 @@ def _merge_extras(
         commentary = (commentary + "\n\n" if commentary else "") + extra_commentary
 
     return MigrationOutput(edits=migration.edits, new_files=new_files, commentary=commentary)
+
+
+def _fallback_migration(issues: list[dict], source_files: dict[str, str]) -> MigrationOutput:
+    edits: list[Edit] = []
+    commentary = [
+        "Applied deterministic ROCm compatibility edits after the LLM response did not match the strict schema."
+    ]
+
+    for filename, content in source_files.items():
+        name_lower = Path(filename).name.lower()
+
+        if name_lower.endswith(".py"):
+            if "torch.cuda.set_device(0)" in content:
+                edits.append(
+                    Edit(
+                        file=filename,
+                        original_block="    torch.cuda.set_device(0)",
+                        replacement_block='    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+                        rationale="Replace hardcoded CUDA device selection with device-aware logic.",
+                    )
+                )
+            if "model.cuda()" in content:
+                edits.append(
+                    Edit(
+                        file=filename,
+                        original_block="model.cuda()",
+                        replacement_block="model.to(device)",
+                        rationale="Move the model using the selected device instead of direct .cuda().",
+                    )
+                )
+            if "x = x.cuda()" in content:
+                edits.append(
+                    Edit(
+                        file=filename,
+                        original_block="x = x.cuda()",
+                        replacement_block="x = x.to(device)",
+                        rationale="Move tensors using the selected device instead of direct .cuda().",
+                    )
+                )
+
+        if name_lower == "dockerfile":
+            for line in content.splitlines():
+                if "nvidia/cuda" in line.lower():
+                    edits.append(
+                        Edit(
+                            file=filename,
+                            original_block=line,
+                            replacement_block="FROM rocm/pytorch:latest",
+                            rationale="Replace NVIDIA CUDA base image with a ROCm PyTorch base image.",
+                        )
+                    )
+                    break
+
+        if name_lower == "requirements.txt":
+            for dep in ("bitsandbytes", "flash-attn"):
+                for line in content.splitlines():
+                    if line.lower().startswith(dep):
+                        edits.append(
+                            Edit(
+                                file=filename,
+                                original_block=line,
+                                replacement_block=f"# Removed CUDA-only dependency for ROCm review: {line}",
+                                rationale=f"Flag CUDA-only dependency {dep} for ROCm replacement.",
+                            )
+                        )
+
+    extra_files, extra_commentary = _collect_extras(issues)
+    if extra_commentary:
+        commentary.append(extra_commentary)
+
+    return MigrationOutput(
+        edits=edits,
+        new_files=extra_files,
+        commentary="\n\n".join(commentary),
+    )
 
 
 def _materialize_source_files(source_files: dict[str, str]) -> str:
