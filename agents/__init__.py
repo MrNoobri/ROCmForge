@@ -129,7 +129,10 @@ def run_migration(input_path: str) -> dict:
 
     # 6. Score before and after
     sb = score_before(issues)
-    sa = score_after([], qa_result)
+    final_patched_dir = migration_result.get("patched_dir", "")
+    after_issue_dicts = run_scanner(final_patched_dir) if final_patched_dir else []
+    after_issues = [_issue_from_dict(issue) for issue in after_issue_dicts]
+    sa = score_after(after_issues, qa_result)
 
     # 7. Build report
     report_markdown = run_report_agent(
@@ -149,6 +152,7 @@ def run_migration(input_path: str) -> dict:
         "qa_result": qa_result,
         "score_before": sb,
         "score_after": sa,
+        "issues_after": after_issue_dicts,
         "report_markdown": report_markdown,
         "attempts": attempts,
         "agent_outputs": {

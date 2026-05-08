@@ -29,6 +29,7 @@ Thumbs.db
 *.swp
 
 # RAG / model artifacts
+.cache/
 .chroma/
 *.sqlite3
 *.bin
