@@ -11,6 +11,37 @@ def main() -> None:
 
     st.title("ROCmForge")
     st.caption("Proof-backed AMD/ROCm migration lab.")
+    st.markdown(
+        """
+        <style>
+        .agent-card {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 8px;
+            padding: 14px 16px;
+            min-height: 142px;
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .agent-step {
+            color: #64748B;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: uppercase;
+        }
+        .agent-name {
+            font-size: 17px;
+            font-weight: 700;
+            margin: 4px 0 8px 0;
+        }
+        .agent-detail {
+            color: #475569;
+            font-size: 14px;
+            line-height: 1.35;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with st.sidebar:
         st.subheader("Input")
@@ -26,13 +57,21 @@ def main() -> None:
         start_migration = st.button("Start Migration", type="primary")
 
     agent_names = [
-        "Code Analyzer",
+        "Scanner",
+        "Compatibility Analyst",
         "ROCm Knowledge",
         "Migration Engineer",
         "QA Tester",
-        "Benchmark",
-        "Report",
+        "Report Writer",
     ]
+    agent_descriptions = {
+        "Scanner": "Finds CUDA, NVIDIA, and hardcoded GPU portability issues.",
+        "Compatibility Analyst": "Turns findings into ROCm risk notes and AMD fix hints.",
+        "ROCm Knowledge": "Pulls local ROCm docs context for each migration decision.",
+        "Migration Engineer": "Produces structured JSON edits and generated files.",
+        "QA Tester": "Runs the patched project on the AMD ROCm sandbox.",
+        "Report Writer": "Builds the final score, patch, QA, and migration report.",
+    }
 
     if "results" not in st.session_state:
         st.session_state.results = None
@@ -41,9 +80,15 @@ def main() -> None:
         st.session_state.results = None
         status_container = st.container()
         status_blocks = {
-            name: status_container.status(name, state="running", expanded=False)
+            name: status_container.status(
+                name,
+                state="running",
+                expanded=False,
+            )
             for name in agent_names
         }
+        for name, block in status_blocks.items():
+            block.write(agent_descriptions[name])
         temp_dir = None
         repo_temp_dir = None
         try:
@@ -62,9 +107,6 @@ def main() -> None:
             with st.spinner("Running migration agents..."):
                 migration_results = agents.run_migration(input_path)
 
-            for name in agent_names:
-                status_blocks[name].update(state="complete")
-
             generated_files = migration_results.get("generated_files", {})
             generated_list = (
                 sorted(generated_files)
@@ -72,17 +114,26 @@ def main() -> None:
                 else list(generated_files)
             )
             qa_result = migration_results.get("qa_result", {})
+            agent_timeline = _build_agent_timeline(
+                agent_names=agent_names,
+                agent_outputs=migration_results.get("agent_outputs", {}),
+                attempts=migration_results.get("attempts", []),
+                qa_result=qa_result,
+                report_markdown=migration_results.get("report_markdown", ""),
+            )
+            for step in agent_timeline:
+                status_blocks[step["name"]].update(state=step["state"])
+
             st.session_state.results = {
                 "readiness_score": migration_results.get("score_before", 0),
+                "score_after": migration_results.get("score_after", 0),
                 "issues": migration_results.get("issues", []),
                 "patch_text": migration_results.get("patch_text", ""),
                 "generated_files": generated_list,
-                "agent_timeline": [
-                    {"name": name, "state": "complete"}
-                    for name in agent_names
-                ],
+                "agent_timeline": agent_timeline,
                 "amd_logs": qa_result.get("logs", ""),
                 "attempts": migration_results.get("attempts", []),
+                "agent_outputs": migration_results.get("agent_outputs", {}),
                 "benchmark": {
                     "before": {"status": "failed", "runtime": None, "memory": None},
                     "after": {
@@ -104,9 +155,17 @@ def main() -> None:
                 cleanup_temp(repo_temp_dir)
 
     results = st.session_state.results
+    if results:
+        top_cols = st.columns(4)
+        top_cols[0].metric("Before Score", f"{results['readiness_score']}/100")
+        top_cols[1].metric("After Score", f"{results.get('score_after', 0)}/100")
+        top_cols[2].metric("Issues Found", len(results.get("issues", [])))
+        top_cols[3].metric("AMD QA", results.get("benchmark", {}).get("after", {}).get("status", "unknown"))
+
     tabs = st.tabs(
         [
             "Input",
+            "Agent Pipeline",
             "Scan Results",
             "Migration Patch",
             "AMD Test",
@@ -127,6 +186,35 @@ def main() -> None:
             st.info("Click Start Migration to populate results.")
 
     with tabs[1]:
+        st.subheader("Agent Pipeline")
+        if results:
+            timeline = results.get("agent_timeline", [])
+            for row_start in range(0, len(timeline), 3):
+                cols = st.columns(3)
+                for col, step in zip(cols, timeline[row_start : row_start + 3]):
+                    with col:
+                        state = step.get("state", "complete")
+                        label = _status_label(state)
+                        st.markdown(
+                            f"""
+                            <div class="agent-card">
+                                <div class="agent-step">Step {step.get('step', '?')} - {label}</div>
+                                <div class="agent-name">{step.get('name', 'Agent')}</div>
+                                <div class="agent-detail">{step.get('description', '')}</div>
+                                <hr>
+                                <div class="agent-detail"><strong>Output:</strong> {step.get('summary', '')}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+            st.divider()
+            with st.expander("Raw agent outputs"):
+                agent_outputs = results.get("agent_outputs", {})
+                st.json(agent_outputs)
+        else:
+            st.info("Run a migration to see all six agents work through the pipeline.")
+
+    with tabs[2]:
         st.subheader("Scan Results")
         if results:
             st.markdown(
@@ -149,10 +237,21 @@ def main() -> None:
                     )
                     st.write(f"{issue['file']}:{issue['line']}")
                     st.write(issue["description"])
+                    if issue.get("amd_fix_hint"):
+                        st.caption(f"AMD fix: {issue['amd_fix_hint']}")
+                    if issue.get("rocm_context"):
+                        with st.expander("ROCm knowledge context"):
+                            st.write(issue["rocm_context"])
+                            sources = issue.get("rocm_sources", [])
+                            if sources:
+                                st.write("Sources")
+                                for source in sources:
+                                    label = source.get("heading") or source.get("source") or "unknown"
+                                    st.write(f"- {label}")
         else:
             st.info("No scan results yet.")
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Migration Patch")
         if results:
             st.code(results["patch_text"], language="diff")
@@ -161,7 +260,7 @@ def main() -> None:
         else:
             st.info("No patch generated yet.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("AMD Test")
         if results:
             status_blocks = []
@@ -190,7 +289,7 @@ def main() -> None:
         else:
             st.info("No AMD test results yet.")
 
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Benchmark")
         if results:
             before = results["benchmark"]["before"]
@@ -213,7 +312,7 @@ def main() -> None:
                 ]
             )
             fig.update_layout(barmode="group", height=360)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             metric_cols = st.columns(3)
             metric_cols[0].metric("Before", "Failed")
@@ -222,7 +321,7 @@ def main() -> None:
         else:
             st.info("No benchmark data yet.")
 
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Final Report")
         if results:
             st.markdown(results["report_markdown"])
@@ -235,4 +334,65 @@ def main() -> None:
             st.info("No report generated yet.")
 
 
-main()
+def _build_agent_timeline(
+    agent_names: list[str],
+    agent_outputs: dict,
+    attempts: list[dict],
+    qa_result: dict,
+    report_markdown: str,
+) -> list[dict]:
+    scanner_count = len(agent_outputs.get("scanner", []))
+    compatibility_count = len(agent_outputs.get("compatibility", []))
+    knowledge_items = agent_outputs.get("knowledge", [])
+    source_count = sum(len(item.get("rocm_sources", [])) for item in knowledge_items)
+    final_attempt = attempts[-1] if attempts else {}
+    edits_count = len(final_attempt.get("edits_raw", []))
+    patch_lines = len((final_attempt.get("patch", "") or "").splitlines())
+    qa_status = qa_result.get("status", "unknown")
+    runtime = qa_result.get("runtime_sec", 0.0)
+
+    summaries = {
+        "Scanner": f"Detected {scanner_count} portability issue(s).",
+        "Compatibility Analyst": f"Added AMD fix hints to {compatibility_count} issue(s).",
+        "ROCm Knowledge": f"Attached docs context for {len(knowledge_items)} issue(s), using {source_count} source reference(s).",
+        "Migration Engineer": f"Generated {edits_count} edit(s) across a {patch_lines}-line patch.",
+        "QA Tester": f"AMD sandbox returned {qa_status} in {runtime}s.",
+        "Report Writer": f"Produced a {len(report_markdown.splitlines())}-line migration report.",
+    }
+    descriptions = {
+        "Scanner": "Static analysis over Python, Dockerfile, requirements, and README files.",
+        "Compatibility Analyst": "Severity-aware translation from CUDA risks to AMD/ROCm actions.",
+        "ROCm Knowledge": "Retrieval from the local ROCm documentation index.",
+        "Migration Engineer": "Structured JSON edits, generated files, and patch application.",
+        "QA Tester": "Remote ROCm execution through the configured AMD sandbox.",
+        "Report Writer": "Readable final artifact for judging, demos, and PR review.",
+    }
+
+    return [
+        {
+            "step": index,
+            "name": name,
+            "state": _status_state(name, qa_status),
+            "description": descriptions[name],
+            "summary": summaries[name],
+        }
+        for index, name in enumerate(agent_names, start=1)
+    ]
+
+
+def _status_state(name: str, qa_status: str) -> str:
+    if name == "QA Tester" and qa_status == "failed":
+        return "error"
+    return "complete"
+
+
+def _status_label(state: str) -> str:
+    return {
+        "complete": "Complete",
+        "error": "Needs Attention",
+        "running": "Running",
+    }.get(state, state.title())
+
+
+if __name__ == "__main__":
+    main()

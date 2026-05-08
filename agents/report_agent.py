@@ -84,3 +84,24 @@ def build_report(
     (OUTPUTS_DIR / "migration_report.md").write_text(report, encoding="utf-8")
 
     return report
+
+
+def run_report_agent(
+    issues: list[dict],
+    patch_text: str,
+    generated_files: dict,
+    qa_result: dict,
+    score_before: int,
+    score_after: int,
+    commentary: str,
+) -> str:
+    """Run the report agent stage."""
+    return build_report(
+        issues=issues,
+        patch_text=patch_text,
+        generated_files=generated_files,
+        qa_result=qa_result,
+        score_before=score_before,
+        score_after=score_after,
+        commentary=commentary,
+    )
