@@ -82,6 +82,7 @@ def main() -> None:
                     for name in agent_names
                 ],
                 "amd_logs": qa_result.get("logs", ""),
+                "attempts": migration_results.get("attempts", []),
                 "benchmark": {
                     "before": {"status": "failed", "runtime": None, "memory": None},
                     "after": {
@@ -169,6 +170,23 @@ def main() -> None:
                     st.status(step["name"], state=step["state"], expanded=False)
                 )
             st.text_area("Logs", value=results["amd_logs"], height=200)
+            attempts = results.get("attempts", [])
+            if attempts:
+                st.write("Attempts")
+                for attempt in attempts:
+                    qa_result = attempt.get("qa_result", {})
+                    label = (
+                        f"Attempt {attempt.get('attempt', '?')} - "
+                        f"{qa_result.get('status', 'unknown')}"
+                    )
+                    with st.expander(label, expanded=qa_result.get("status") == "failed"):
+                        st.code(attempt.get("patch", "") or "(no patch)", language="diff")
+                        st.text_area(
+                            "QA logs",
+                            value=qa_result.get("logs", ""),
+                            height=160,
+                            key=f"qa_logs_attempt_{attempt.get('attempt', '?')}",
+                        )
         else:
             st.info("No AMD test results yet.")
 

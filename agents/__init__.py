@@ -36,6 +36,7 @@ from agents.qa_agent import run_qa
 from agents.report_agent import build_report
 
 _TARGET_FILENAMES = {"dockerfile", "requirements.txt"}
+_MAX_QA_RETRIES = 2
 
 
 def _read_source_files(input_path: str) -> dict[str, str]:
@@ -83,20 +84,44 @@ def run_migration(input_path: str) -> dict:
     # 2. Read source files for the migration agent
     source_files = _read_source_files(input_path)
 
-    # 3. Run migration agent (produces patch + generated files)
-    migration_result = run_migration_agent(
-        issues_json=json.dumps(issues_dicts),
-        source_files=source_files,
-    )
+    # 3-4. Generate a patch and QA it. If QA fails, feed the logs back to the
+    # migration agent for up to two correction attempts.
+    attempts = []
+    migration_result: dict = {}
+    qa_result: dict = {}
+    qa_feedback = ""
+    issues_json = json.dumps(issues_dicts)
 
-    # 4. QA check on the patched directory
-    patched_dir = migration_result.get("patched_dir", "")
-    qa_result = run_qa(patched_dir) if patched_dir else {
-        "status": "failed",
-        "logs": "No patched directory produced by migration agent.",
-        "runtime_sec": 0.0,
-        "gpu_memory_gb": 0.0,
-    }
+    for attempt_number in range(1, _MAX_QA_RETRIES + 2):
+        migration_result = run_migration_agent(
+            issues_json=issues_json,
+            source_files=source_files,
+            qa_feedback=qa_feedback,
+        )
+
+        patched_dir = migration_result.get("patched_dir", "")
+        qa_result = run_qa(patched_dir) if patched_dir else {
+            "status": "failed",
+            "logs": "No patched directory produced by migration agent.",
+            "runtime_sec": 0.0,
+            "gpu_memory_gb": 0.0,
+            "exit_code": -1,
+        }
+
+        attempts.append(
+            {
+                "attempt": attempt_number,
+                "patch": migration_result.get("patch_text", ""),
+                "qa_result": qa_result,
+                "commentary": migration_result.get("commentary", ""),
+                "edits_raw": migration_result.get("edits_raw", []),
+            }
+        )
+
+        if qa_result.get("status") != "failed":
+            break
+
+        qa_feedback = str(qa_result.get("logs", ""))
 
     # 5. Score before and after
     sb = score_before(issues)
@@ -121,10 +146,5 @@ def run_migration(input_path: str) -> dict:
         "score_before": sb,
         "score_after": sa,
         "report_markdown": report_markdown,
-        "attempts": [
-            {
-                "patch": migration_result.get("patch_text", ""),
-                "qa_result": qa_result,
-            }
-        ],
+        "attempts": attempts,
     }
