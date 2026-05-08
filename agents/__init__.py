@@ -1,6 +1,5 @@
 """ROCmForge agent orchestrator — single entry point for the Streamlit UI."""
 
-import dataclasses
 import json
 import os
 import tempfile
@@ -29,11 +28,14 @@ try:
 except ImportError:
     pass
 
-from core.pattern_scanner import scan
+from core.pattern_scanner import Issue
 from core.scoring import score_before, score_after
+from agents.compatibility_agent import run_compatibility_agent
+from agents.knowledge_agent import run_knowledge_agent
 from agents.migration_agent import run_migration_agent
 from agents.qa_agent import run_qa
-from agents.report_agent import build_report
+from agents.report_agent import run_report_agent
+from agents.scanner_agent import run_scanner
 
 _TARGET_FILENAMES = {"dockerfile", "requirements.txt"}
 _MAX_QA_RETRIES = 2
@@ -77,14 +79,16 @@ def run_migration(input_path: str) -> dict:
         issues, patch_text, generated_files, qa_result,
         score_before, score_after, report_markdown, attempts.
     """
-    # 1. Scan for CUDA/NVIDIA issues
-    issues = scan(input_path)
-    issues_dicts = [dataclasses.asdict(i) for i in issues]
+    # 1-3. Run scanner, compatibility, and knowledge agents before migration.
+    scanner_issues = run_scanner(input_path)
+    issues = [_issue_from_dict(issue) for issue in scanner_issues]
+    compatibility_issues = run_compatibility_agent(scanner_issues)
+    issues_dicts = run_knowledge_agent(compatibility_issues)
 
     # 2. Read source files for the migration agent
     source_files = _read_source_files(input_path)
 
-    # 3-4. Generate a patch and QA it. If QA fails, feed the logs back to the
+    # 4-5. Generate a patch and QA it. If QA fails, feed the logs back to the
     # migration agent for up to two correction attempts.
     attempts = []
     migration_result: dict = {}
@@ -123,12 +127,12 @@ def run_migration(input_path: str) -> dict:
 
         qa_feedback = str(qa_result.get("logs", ""))
 
-    # 5. Score before and after
+    # 6. Score before and after
     sb = score_before(issues)
     sa = score_after([], qa_result)
 
-    # 6. Build report
-    report_markdown = build_report(
+    # 7. Build report
+    report_markdown = run_report_agent(
         issues=issues_dicts,
         patch_text=migration_result.get("patch_text", ""),
         generated_files=migration_result.get("generated_files", {}),
@@ -147,4 +151,20 @@ def run_migration(input_path: str) -> dict:
         "score_after": sa,
         "report_markdown": report_markdown,
         "attempts": attempts,
+        "agent_outputs": {
+            "scanner": scanner_issues,
+            "compatibility": compatibility_issues,
+            "knowledge": issues_dicts,
+        },
     }
+
+
+def _issue_from_dict(issue: dict) -> Issue:
+    return Issue(
+        file=str(issue.get("file", "")),
+        line=int(issue.get("line", 0)),
+        severity=issue.get("severity", "medium"),
+        pattern_id=str(issue.get("pattern_id", "")),
+        snippet=str(issue.get("snippet", "")),
+        description=str(issue.get("description", "")),
+    )
