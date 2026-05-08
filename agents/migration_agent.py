@@ -41,14 +41,18 @@ _SYSTEM_PROMPT = (
 )
 
 
-def run_migration_agent(issues_json: str, source_files: dict[str, str]) -> dict:
+def run_migration_agent(
+    issues_json: str,
+    source_files: dict[str, str],
+    qa_feedback: str = "",
+) -> dict:
     """Run the migration agent and apply edits to a temp workspace."""
     issues = _safe_load_issues(issues_json)
     extra_new_files, extra_commentary = _collect_extras(issues)
 
     llm = _build_llm()
     source_files_json = json.dumps(source_files, ensure_ascii=True)
-    prompt = _build_prompt(issues_json, source_files_json)
+    prompt = _build_prompt(issues_json, source_files_json, qa_feedback=qa_feedback)
 
     parsed = _request_migration_output(llm, prompt)
     if parsed is None or (not parsed.edits and not parsed.new_files):
@@ -132,13 +136,24 @@ def _normalize_model_name(model_name: str) -> str:
     return f"{provider}/{model_name}"
 
 
-def _build_prompt(issues_json: str, source_files_json: str) -> str:
-    return (
+def _build_prompt(
+    issues_json: str,
+    source_files_json: str,
+    qa_feedback: str = "",
+) -> str:
+    prompt = (
         f"{_SYSTEM_PROMPT}\n\n"
         "Issues JSON:\n"
         f"{issues_json}\n\n"
         "Source files JSON (filename -> content):\n"
         f"{source_files_json}\n\n"
+    )
+    if qa_feedback:
+        prompt += (
+            "The previous patch failed with the following error. Produce a corrected patch.\n"
+            f"{qa_feedback}\n\n"
+        )
+    return prompt + (
         "Return a JSON object with keys: edits (list), new_files (object), commentary (string)."
     )
 
