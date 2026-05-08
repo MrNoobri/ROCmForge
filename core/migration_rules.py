@@ -421,18 +421,26 @@ def _rule_device_string_cuda(issue: dict, source_files: dict[str, str], _edits: 
     ]
 
 
+_CUDA_CALL_RE = re.compile(r"\.cuda\((?P<args>[^()]*)\)")
+
+
 def _rule_pytorch_cuda_method(issue: dict, source_files: dict[str, str], _edits: list[Edit]) -> list[Edit]:
     filename = str(issue.get("file", ""))
     if not _is_py(filename) or filename not in source_files:
         return []
     line_no = int(issue.get("line", 0))
     content, line, indent = _file_lines(source_files, filename, line_no)
-    if not line or ".cuda()" not in line or "torch.cuda." in line:
+    if not line:
+        return []
+    # Skip torch.cuda.<something>() calls (e.g. torch.cuda.synchronize) — those
+    # are portable on ROCm because torch maps the cuda namespace to HIP.
+    cuda_match = _CUDA_CALL_RE.search(line)
+    if not cuda_match or "torch.cuda." in line:
         return []
 
     stripped = line.strip()
     hf_models = _hf_model_variables(content)
-    var_match = re.match(r"(?P<var>[A-Za-z_][A-Za-z0-9_\.]*)\.cuda\(\)", stripped)
+    var_match = re.match(r"(?P<var>[A-Za-z_][A-Za-z0-9_\.]*)\.cuda\(", stripped)
     is_hf_dispatched = (
         var_match
         and var_match.group("var") in hf_models
@@ -442,7 +450,13 @@ def _rule_pytorch_cuda_method(issue: dict, source_files: dict[str, str], _edits:
     if is_hf_dispatched:
         replacement = f"{indent}# Removed {stripped}; HF device_map dispatches with Accelerate hooks."
     else:
-        replacement = line.replace(".cuda()", ".to(device)")
+        # Preserve any arguments to .cuda() (e.g. non_blocking=True).
+        args = cuda_match.group("args").strip()
+        if args:
+            new_call = f".to(device, {args})"
+        else:
+            new_call = ".to(device)"
+        replacement = line[: cuda_match.start()] + new_call + line[cuda_match.end():]
         if replacement == line:
             return []
     return [
@@ -450,7 +464,7 @@ def _rule_pytorch_cuda_method(issue: dict, source_files: dict[str, str], _edits:
             file=filename,
             original_block=line,
             replacement_block=replacement,
-            rationale="Replace direct .cuda() with .to(device); skip when HF Accelerate dispatches the model.",
+            rationale="Replace direct .cuda(...) with .to(device, ...); skip when HF Accelerate dispatches the model.",
         )
     ]
 
@@ -470,6 +484,27 @@ def _rule_dep_cuda_only(issue: dict, source_files: dict[str, str], _edits: list[
             original_block=line,
             replacement_block=replacement,
             rationale="CUDA-only dependency; flag for ROCm-compatible replacement.",
+        )
+    ]
+
+
+def _rule_dep_pinned_version_conflict(issue: dict, source_files: dict[str, str], _edits: list[Edit]) -> list[Edit]:
+    filename = str(issue.get("file", ""))
+    if filename not in source_files:
+        return []
+    line_no = int(issue.get("line", 0))
+    _, line, _ = _file_lines(source_files, filename, line_no)
+    if not line or "==" not in line:
+        return []
+    replacement = re.sub(r"==(\d)", r">=\1", line)
+    if replacement == line:
+        return []
+    return [
+        Edit(
+            file=filename,
+            original_block=line,
+            replacement_block=replacement,
+            rationale="Relax exact pin to >= so the ROCm sandbox's pre-installed newer version is accepted.",
         )
     ]
 
@@ -511,6 +546,49 @@ def _rule_docker_nvidia_base(issue: dict, source_files: dict[str, str], _edits: 
             original_block=line,
             replacement_block="FROM rocm/pytorch:latest",
             rationale="Replace NVIDIA CUDA base image with a ROCm PyTorch base image.",
+        )
+    ]
+
+
+def _rule_docker_cuda_home(issue: dict, source_files: dict[str, str], _edits: list[Edit]) -> list[Edit]:
+    filename = str(issue.get("file", ""))
+    if filename not in source_files:
+        return []
+    line_no = int(issue.get("line", 0))
+    _, line, _ = _file_lines(source_files, filename, line_no)
+    if not line:
+        return []
+    return [
+        Edit(
+            file=filename,
+            original_block=line,
+            replacement_block=f"# Removed CUDA_HOME for ROCm portability: {line.strip()}",
+            rationale="Dockerfile CUDA_HOME forces CUDA toolkit paths; ROCm uses ROCM_PATH.",
+        )
+    ]
+
+
+def _rule_docker_cuda_visible_devices(issue: dict, source_files: dict[str, str], _edits: list[Edit]) -> list[Edit]:
+    filename = str(issue.get("file", ""))
+    if filename not in source_files:
+        return []
+    line_no = int(issue.get("line", 0))
+    _, line, _ = _file_lines(source_files, filename, line_no)
+    if not line:
+        return []
+    replacement = re.sub(
+        r"\bCUDA_VISIBLE_DEVICES\b",
+        "HIP_VISIBLE_DEVICES",
+        line,
+    )
+    if replacement == line:
+        return []
+    return [
+        Edit(
+            file=filename,
+            original_block=line,
+            replacement_block=replacement,
+            rationale="ROCm reads HIP_VISIBLE_DEVICES (and ROCR_VISIBLE_DEVICES) instead of CUDA_VISIBLE_DEVICES.",
         )
     ]
 
@@ -638,15 +716,9 @@ def _global_post_edits(
         if already_added:
             continue
 
-        # Find the exact text of the first top-level `import torch` line.
-        anchor_match = re.search(
-            r"^(import torch(?:\s+as\s+\w+)?)\s*$",
-            content,
-            flags=re.MULTILINE,
-        )
-        if not anchor_match:
+        anchor_line = _find_last_toplevel_import(content)
+        if anchor_line is None:
             continue
-        anchor_line = anchor_match.group(1)
         key = (filename, anchor_line)
         if key in seen_keys:
             continue
@@ -660,6 +732,39 @@ def _global_post_edits(
             )
         )
     return extra
+
+
+def _find_last_toplevel_import(content: str) -> str | None:
+    """Return the literal text of the last top-level import line in `content`.
+
+    The returned string is suitable as `original_block` for an Edit. We require
+    that the line not be inside a try/if/conditional, by checking that it has
+    zero indentation and that no later top-level import follows it.
+    """
+    lines = content.splitlines()
+    last_import_idx = -1
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        if line[0] in (" ", "\t"):
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            last_import_idx = i
+
+    if last_import_idx < 0:
+        return None
+
+    anchor_line = lines[last_import_idx]
+    # Make sure the literal anchor_line is unique enough; if not, fall back to
+    # `import torch` (the post-pass caller already filtered for files using
+    # torch).
+    if content.count(anchor_line) > 1:
+        for fallback in ("import torch", "import torch as torch"):
+            if content.count(fallback) == 1:
+                return fallback
+        return None
+    return anchor_line
 
 
 def _hf_model_variables(content: str) -> set[str]:
@@ -695,7 +800,10 @@ RULES: dict[str, RuleFn] = {
     "pytorch_cuda_method": _rule_pytorch_cuda_method,
     "dep_cuda_only": _rule_dep_cuda_only,
     "dep_torch_cuda_wheel": _rule_dep_torch_cuda_wheel,
+    "dep_pinned_version_conflict": _rule_dep_pinned_version_conflict,
     "docker_nvidia_base": _rule_docker_nvidia_base,
+    "docker_cuda_home": _rule_docker_cuda_home,
+    "docker_cuda_visible_devices": _rule_docker_cuda_visible_devices,
     "torch_dtype_float16": _rule_torch_dtype_float16,
 
     # Runtime classifications — same outputs, different triggers
