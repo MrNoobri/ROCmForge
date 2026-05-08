@@ -1,4 +1,14 @@
-"""Migration agent for generating ROCm-compatible edits."""
+"""Migration agent for generating ROCm-compatible edits.
+
+Architecture:
+    1. Deterministic rule registry (core.migration_rules) handles every issue
+       it knows how to fix. This is the *primary* fix path.
+    2. The LLM is invoked only on issues the registry could not handle, with a
+       structured checklist prompt and (on retry) the previous patch + the
+       skipped-edit feedback from patch_utils.
+    3. Final edits = deterministic edits + LLM edits, merged with the LLM
+       losing on conflicts (the registry is canonical).
+"""
 
 from __future__ import annotations
 
@@ -11,6 +21,7 @@ from pathlib import Path
 
 from crewai import Agent, Crew, LLM, Task
 
+from core.migration_rules import apply_rules
 from core.patch_utils import Edit, MigrationOutput, apply_edits
 
 
@@ -45,21 +56,75 @@ def run_migration_agent(
     issues_json: str,
     source_files: dict[str, str],
     qa_feedback: str = "",
+    previous_patch: str = "",
+    previous_skipped_edits: list[dict] | None = None,
 ) -> dict:
     """Run the migration agent and apply edits to a temp workspace."""
     issues = _safe_load_issues(issues_json)
     extra_new_files, extra_commentary = _collect_extras(issues)
 
-    llm = _build_llm()
-    source_files_json = json.dumps(source_files, ensure_ascii=True)
-    prompt = _build_prompt(issues_json, source_files_json, qa_feedback=qa_feedback)
+    # 1. Deterministic rules first.
+    deterministic_edits, handled_issues = apply_rules(issues, source_files)
+    handled_pattern_ids = {str(i.get("pattern_id", "")) for i in handled_issues}
+    unhandled = [i for i in issues if str(i.get("pattern_id", "")) not in handled_pattern_ids]
 
-    parsed = _request_migration_output(llm, prompt)
-    if parsed is None or (not parsed.edits and not parsed.new_files):
-        migration = _fallback_migration(issues, source_files)
-    else:
-        migration = _merge_extras(parsed, extra_new_files, extra_commentary)
-    migration = _ensure_required_edits(migration, issues, source_files)
+    # 2. LLM on the residual (skip if everything is already handled and there
+    # is no QA feedback to react to).
+    llm_edits: list[Edit] = []
+    llm_new_files: dict[str, str] = {}
+    llm_commentary = ""
+    if unhandled or qa_feedback:
+        llm_output = _ask_llm(
+            unhandled_issues=unhandled,
+            source_files=source_files,
+            qa_feedback=qa_feedback,
+            previous_patch=previous_patch,
+            previous_skipped_edits=previous_skipped_edits or [],
+            handled_pattern_ids=sorted(handled_pattern_ids),
+        )
+        if llm_output is not None:
+            llm_edits = list(llm_output.edits)
+            llm_new_files = dict(llm_output.new_files)
+            llm_commentary = llm_output.commentary
+
+    # 3. Validate LLM edits — reject anything that looks like a hallucinated
+    # rewrite of working code. The LLM should only touch lines whose original
+    # text contains a CUDA/ROCm signal, or lines tied to a known issue.
+    validated_llm_edits, rejected_llm_edits = _validate_llm_edits(
+        llm_edits, issues, source_files
+    )
+
+    # 4. Merge — registry wins on conflicts.
+    merged_edits = list(deterministic_edits)
+    seen_keys = {(e.file, e.original_block) for e in merged_edits}
+    for edit in validated_llm_edits:
+        key = (edit.file, edit.original_block)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        merged_edits.append(edit)
+
+    new_files = dict(extra_new_files)
+    for filename, content in llm_new_files.items():
+        new_files.setdefault(filename, content)
+
+    commentary_parts: list[str] = []
+    if extra_commentary:
+        commentary_parts.append(extra_commentary)
+    if deterministic_edits:
+        commentary_parts.append(
+            f"Deterministic registry produced {len(deterministic_edits)} edit(s) covering "
+            f"{len(handled_pattern_ids)} pattern(s); LLM handled {len(unhandled)} residual issue(s)."
+        )
+    if llm_commentary:
+        commentary_parts.append(llm_commentary)
+    commentary = "\n\n".join(p for p in commentary_parts if p)
+
+    migration = MigrationOutput(
+        edits=merged_edits,
+        new_files=new_files,
+        commentary=commentary,
+    )
 
     source_dir = _materialize_source_files(source_files)
     patch_result = apply_edits(migration, source_dir)
@@ -70,7 +135,221 @@ def run_migration_agent(
         "commentary": migration.commentary,
         "edits_raw": [edit.model_dump() for edit in migration.edits],
         "patched_dir": patch_result["patched_dir"],
+        "applied_edits": patch_result.get("applied_edits", []),
+        "skipped_edits": patch_result.get("skipped_edits", []),
+        "deterministic_edit_count": len(deterministic_edits),
+        "llm_edit_count": len(validated_llm_edits),
+        "llm_rejected_edits": rejected_llm_edits,
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM edit validation
+# ---------------------------------------------------------------------------
+
+# Tokens that indicate a line is plausibly CUDA/ROCm-related and therefore
+# fair game for the LLM to rewrite.
+_CUDA_SIGNAL_TOKENS = (
+    "cuda",
+    "cudnn",
+    "nccl",
+    "rccl",
+    "nvidia",
+    "nvcc",
+    "nvtx",
+    "bitsandbytes",
+    "bnb",
+    "load_in_4bit",
+    "load_in_8bit",
+    "device_map",
+    "torch.device",
+    "set_device",
+    "is_available",
+    "to(device",
+    "torch_dtype",
+    "torch.float16",
+    "torch.half",
+    "torch.bfloat16",
+    "autocast",
+    "rocm",
+    "hip",
+    "amp",
+    "gpu",
+    "flash_attn",
+    "flash-attn",
+    "from_pretrained",
+    "AutoModel",
+    "AutoTokenizer",
+    "pin_memory",
+)
+
+
+def _validate_llm_edits(
+    llm_edits: list[Edit],
+    issues: list[dict],
+    source_files: dict[str, str],
+) -> tuple[list[Edit], list[dict]]:
+    """Reject LLM edits that don't touch CUDA-relevant lines.
+
+    Without this guard the LLM tends to "improve" working code (e.g. rewriting
+    `padding=True` to `padding='longest'` or `return_tensors="pt"` to
+    `return_tensors=torch.Tensor`) under the banner of "ROCm compatibility".
+    Only edits whose original_block overlaps a known issue line, a runtime
+    traceback line, or contains an explicit CUDA/ROCm signal are kept.
+    """
+    issue_lines_by_file = _issue_lines_by_file(issues, source_files)
+    accepted: list[Edit] = []
+    rejected: list[dict] = []
+
+    for edit in llm_edits:
+        if not edit.original_block.strip():
+            rejected.append(
+                {
+                    "edit": edit.model_dump(),
+                    "reason": "empty_original_block",
+                }
+            )
+            continue
+
+        if _has_cuda_signal(edit.original_block) or _has_cuda_signal(edit.replacement_block):
+            accepted.append(edit)
+            continue
+
+        # Replacement that ONLY adds a comment / removes code referenced by an
+        # issue is acceptable; e.g. "# remove this" replacing a CUDA line.
+        if _is_pure_comment_or_removal(edit.replacement_block) and _has_cuda_signal(edit.original_block):
+            accepted.append(edit)
+            continue
+
+        # Allow if the edit overlaps a known issue line in the same file.
+        file_issue_lines = issue_lines_by_file.get(edit.file, set())
+        if _overlaps_known_lines(edit.original_block, edit.file, file_issue_lines, source_files):
+            accepted.append(edit)
+            continue
+
+        rejected.append(
+            {
+                "edit": edit.model_dump(),
+                "reason": "no_cuda_signal_and_no_issue_overlap",
+            }
+        )
+
+    return accepted, rejected
+
+
+def _has_cuda_signal(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return any(token.lower() in lower for token in _CUDA_SIGNAL_TOKENS)
+
+
+def _is_pure_comment_or_removal(text: str) -> bool:
+    if not text.strip():
+        return True
+    return all(line.lstrip().startswith("#") or not line.strip() for line in text.splitlines())
+
+
+def _issue_lines_by_file(
+    issues: list[dict],
+    source_files: dict[str, str],
+) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    for issue in issues:
+        raw_file = str(issue.get("file", ""))
+        line = int(issue.get("line", 0) or 0)
+        if line <= 0:
+            continue
+        # Resolve to a source_files key (same logic as migration_rules).
+        match = _resolve_to_source_key(raw_file, source_files)
+        if match is None:
+            continue
+        out.setdefault(match, set()).add(line)
+    return out
+
+
+def _resolve_to_source_key(raw: str, source_files: dict[str, str]) -> str | None:
+    if not raw:
+        return None
+    if raw in source_files:
+        return raw
+    posix = raw.replace("\\", "/")
+    if posix in source_files:
+        return posix
+    for key in source_files:
+        if posix.endswith("/" + key) or posix.endswith(key):
+            return key
+    base = posix.rsplit("/", 1)[-1]
+    if base in source_files:
+        return base
+    return None
+
+
+def _overlaps_known_lines(
+    original_block: str,
+    filename: str,
+    known_lines: set[int],
+    source_files: dict[str, str],
+) -> bool:
+    if not known_lines:
+        return False
+    content = source_files.get(filename, "")
+    if not content:
+        return False
+
+    block_lines = [ln.strip() for ln in original_block.splitlines() if ln.strip()]
+    if not block_lines:
+        return False
+
+    # For each non-blank line of original_block, find its line number in the
+    # source. If any of those line numbers is in known_lines, the block
+    # overlaps a known issue.
+    source_lines = content.splitlines()
+    for block_line in block_lines:
+        for idx, source_line in enumerate(source_lines, start=1):
+            if block_line in source_line and idx in known_lines:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# LLM plumbing
+# ---------------------------------------------------------------------------
+
+
+def _ask_llm(
+    unhandled_issues: list[dict],
+    source_files: dict[str, str],
+    qa_feedback: str,
+    previous_patch: str,
+    previous_skipped_edits: list[dict],
+    handled_pattern_ids: list[str],
+) -> MigrationOutput | None:
+    try:
+        llm = _build_llm()
+    except RuntimeError:
+        return None
+
+    prompt = _build_prompt(
+        unhandled_issues=unhandled_issues,
+        source_files=source_files,
+        qa_feedback=qa_feedback,
+        previous_patch=previous_patch,
+        previous_skipped_edits=previous_skipped_edits,
+        handled_pattern_ids=handled_pattern_ids,
+    )
+    response = _run_llm(llm, prompt)
+    parsed, error = _parse_migration_output(response)
+    if parsed is not None:
+        return parsed
+
+    retry = (
+        f"{prompt}\n\nYour previous response was not valid JSON ({error}). "
+        "Output ONLY the JSON object, no markdown."
+    )
+    response = _run_llm(llm, retry)
+    parsed, _ = _parse_migration_output(response)
+    return parsed
 
 
 def _build_llm() -> LLM:
@@ -138,40 +417,97 @@ def _normalize_model_name(model_name: str) -> str:
 
 
 def _build_prompt(
-    issues_json: str,
-    source_files_json: str,
-    qa_feedback: str = "",
+    unhandled_issues: list[dict],
+    source_files: dict[str, str],
+    qa_feedback: str,
+    previous_patch: str,
+    previous_skipped_edits: list[dict],
+    handled_pattern_ids: list[str],
 ) -> str:
-    prompt = (
-        f"{_SYSTEM_PROMPT}\n\n"
-        "Issues JSON:\n"
-        f"{issues_json}\n\n"
-        "Source files JSON (filename -> content):\n"
-        f"{source_files_json}\n\n"
-    )
-    if qa_feedback:
-        prompt += (
-            "The previous patch failed with the following error. Produce a corrected patch.\n"
-            f"{qa_feedback}\n\n"
+    sections: list[str] = [_SYSTEM_PROMPT, ""]
+
+    if handled_pattern_ids:
+        sections.append(
+            "DETERMINISTIC RULES already produced edits for these patterns "
+            f"(do not re-emit them): {', '.join(handled_pattern_ids)}."
         )
-    return prompt + (
-        "Return a JSON object with keys: edits (list), new_files (object), commentary (string)."
+        sections.append("")
+
+    if unhandled_issues:
+        sections.append(
+            "RESIDUAL ISSUES — produce one edit (or new_files entry) per item, "
+            "and acknowledge each id in commentary:"
+        )
+        sections.append(_render_issue_checklist(unhandled_issues))
+        sections.append("")
+    else:
+        sections.append(
+            "There are no residual static issues — focus on the QA runtime feedback below."
+        )
+        sections.append("")
+
+    sections.append("Source files JSON (filename -> content):")
+    sections.append(json.dumps(source_files, ensure_ascii=True))
+    sections.append("")
+
+    if previous_patch:
+        sections.append(
+            "PREVIOUS PATCH (already applied; do not re-emit identical edits, "
+            "produce only deltas that fix the runtime failure):"
+        )
+        sections.append(previous_patch[:6000])
+        sections.append("")
+
+    if previous_skipped_edits:
+        sections.append(
+            "PREVIOUS PATCH SKIPPED EDITS — these edits failed to apply. "
+            "Either reformulate them (match exact text in the source) or skip if obsolete:"
+        )
+        sections.append(json.dumps(previous_skipped_edits, ensure_ascii=True)[:4000])
+        sections.append("")
+
+    if qa_feedback:
+        sections.append(
+            "QA RUNTIME FEEDBACK — treat as authoritative evidence. Produce edits "
+            "that fix the root cause, not one-line workarounds:"
+        )
+        sections.append(qa_feedback[:6000])
+        sections.append("")
+
+    sections.append(
+        "STRICT RULES — violations will be rejected:\n"
+        "1. Edit ONLY lines that contain a CUDA/NVIDIA/ROCm signal "
+        "(.cuda(), torch.cuda.*, bitsandbytes, device_map, CUDA_*, nvidia-smi, "
+        "torch_dtype=torch.float16, etc.) OR lines explicitly listed as residual "
+        "issues above.\n"
+        "2. DO NOT edit lines that work fine (e.g. padding=True, "
+        "return_tensors=\"pt\", model.eval(), unrelated config). If a runtime "
+        "error is from a pre-existing app bug (missing pad_token, missing data "
+        "file, bad CLI args), DO NOT try to fix it — note it in commentary "
+        "instead.\n"
+        "3. original_block MUST appear verbatim in the source file.\n"
+        "4. Prefer minimal, surgical edits over rewrites.\n\n"
+        "Return JSON: {\"edits\": [{\"file\":..., \"original_block\":..., "
+        "\"replacement_block\":..., \"rationale\":...}], "
+        "\"new_files\": {filename: content}, \"commentary\": \"...\"}."
     )
+    return "\n".join(sections)
 
 
-def _request_migration_output(llm: LLM, prompt: str) -> MigrationOutput | None:
-    response = _run_llm(llm, prompt)
-    parsed, error = _parse_migration_output(response)
-    if parsed is not None:
-        return parsed
-
-    retry_prompt = (
-        f"{prompt}\n\nYour previous response was not valid JSON. Error: {error}. "
-        "Try again, output ONLY the JSON object."
-    )
-    response = _run_llm(llm, retry_prompt)
-    parsed, _ = _parse_migration_output(response)
-    return parsed
+def _render_issue_checklist(issues: list[dict]) -> str:
+    lines: list[str] = []
+    for issue in issues:
+        lines.append(
+            f"- [{issue.get('pattern_id', '?')}] {issue.get('file', '?')}:"
+            f"{issue.get('line', 0)} | {issue.get('description', '')} | "
+            f"snippet: {str(issue.get('snippet', ''))[:160]}"
+        )
+        if issue.get("amd_fix_hint"):
+            lines.append(f"    fix hint: {issue['amd_fix_hint']}")
+        if issue.get("rocm_context"):
+            ctx = str(issue["rocm_context"]).replace("\n", " ")
+            lines.append(f"    rocm: {ctx[:200]}")
+    return "\n".join(lines)
 
 
 def _run_llm(llm: LLM, prompt: str) -> str:
@@ -243,7 +579,7 @@ def _collect_extras(issues: list[dict]) -> tuple[dict[str, str], str]:
     for issue in issues:
         pattern_id = issue.get("pattern_id", "")
         snippet = issue.get("snippet", "")
-        if pattern_id in {"import_bitsandbytes", "dep_cuda_only"} and "bitsandbytes" in snippet.lower():
+        if pattern_id in {"import_bitsandbytes", "dep_cuda_only"} and "bitsandbytes" in str(snippet).lower():
             extra_commentary = (
                 "AMD replacement: use Hugging Face Optimum-AMD (pip install optimum[amd]) "
                 "or AutoGPTQ - both have native ROCm/Triton support and do not require "
@@ -259,269 +595,6 @@ def _extract_model_name(text: str) -> str | None:
     if match:
         return match.group(1)
     return None
-
-
-def _merge_extras(
-    migration: MigrationOutput,
-    extra_files: dict[str, str],
-    extra_commentary: str,
-) -> MigrationOutput:
-    if not extra_files and not extra_commentary:
-        return migration
-
-    new_files = dict(migration.new_files)
-    for filename, content in extra_files.items():
-        if filename in new_files:
-            new_files[filename] = new_files[filename].rstrip() + "\n\n" + content
-        else:
-            new_files[filename] = content
-
-    commentary = migration.commentary
-    if extra_commentary:
-        commentary = (commentary + "\n\n" if commentary else "") + extra_commentary
-
-    return MigrationOutput(edits=migration.edits, new_files=new_files, commentary=commentary)
-
-
-def _fallback_migration(issues: list[dict], source_files: dict[str, str]) -> MigrationOutput:
-    edits: list[Edit] = []
-    commentary = [
-        "Applied deterministic ROCm compatibility edits after the LLM response did not match the strict schema."
-    ]
-
-    for filename, content in source_files.items():
-        name_lower = Path(filename).name.lower()
-
-        if name_lower.endswith(".py"):
-            if "torch.cuda.set_device(0)" in content:
-                edits.append(
-                    Edit(
-                        file=filename,
-                        original_block="    torch.cuda.set_device(0)",
-                        replacement_block='    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
-                        rationale="Replace hardcoded CUDA device selection with device-aware logic.",
-                    )
-                )
-            if "model.cuda()" in content:
-                edits.append(
-                    Edit(
-                        file=filename,
-                        original_block="model.cuda()",
-                        replacement_block="model.to(device)",
-                        rationale="Move the model using the selected device instead of direct .cuda().",
-                    )
-                )
-            if "x = x.cuda()" in content:
-                edits.append(
-                    Edit(
-                        file=filename,
-                        original_block="x = x.cuda()",
-                        replacement_block="x = x.to(device)",
-                        rationale="Move tensors using the selected device instead of direct .cuda().",
-                    )
-                )
-
-        if name_lower == "dockerfile":
-            for line in content.splitlines():
-                if "nvidia/cuda" in line.lower():
-                    edits.append(
-                        Edit(
-                            file=filename,
-                            original_block=line,
-                            replacement_block="FROM rocm/pytorch:latest",
-                            rationale="Replace NVIDIA CUDA base image with a ROCm PyTorch base image.",
-                        )
-                    )
-                    break
-
-        if name_lower == "requirements.txt":
-            for dep in ("bitsandbytes", "flash-attn"):
-                for line in content.splitlines():
-                    if line.lower().startswith(dep):
-                        edits.append(
-                            Edit(
-                                file=filename,
-                                original_block=line,
-                                replacement_block=f"# Removed CUDA-only dependency for ROCm review: {line}",
-                                rationale=f"Flag CUDA-only dependency {dep} for ROCm replacement.",
-                            )
-                        )
-
-    extra_files, extra_commentary = _collect_extras(issues)
-    if extra_commentary:
-        commentary.append(extra_commentary)
-
-    return MigrationOutput(
-        edits=edits,
-        new_files=extra_files,
-        commentary="\n\n".join(commentary),
-    )
-
-
-def _ensure_required_edits(
-    migration: MigrationOutput,
-    issues: list[dict],
-    source_files: dict[str, str],
-) -> MigrationOutput:
-    """Add deterministic fixes for known hard failures the LLM may miss."""
-    edits = list(migration.edits)
-    commentary = migration.commentary
-    needs_bitsandbytes_fix = any(
-        issue.get("pattern_id") in {"import_bitsandbytes", "dep_cuda_only"}
-        and "bitsandbytes" in str(issue.get("snippet", "")).lower()
-        for issue in issues
-    )
-
-    if needs_bitsandbytes_fix:
-        for filename, content in source_files.items():
-            if not filename.lower().endswith(".py"):
-                continue
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped == "import bitsandbytes" or stripped.startswith("import bitsandbytes as "):
-                    _append_unique_edit(
-                        edits,
-                        Edit(
-                            file=filename,
-                            original_block=line,
-                            replacement_block=f"# Removed CUDA-only bitsandbytes import for ROCm review: {stripped}",
-                            rationale="Prevent runtime failure on ROCm where bitsandbytes is unavailable or CUDA-specific.",
-                        ),
-                    )
-                elif stripped.startswith("from bitsandbytes import "):
-                    _append_unique_edit(
-                        edits,
-                        Edit(
-                            file=filename,
-                            original_block=line,
-                            replacement_block=f"# Removed CUDA-only bitsandbytes import for ROCm review: {stripped}",
-                            rationale="Prevent runtime failure on ROCm where bitsandbytes is unavailable or CUDA-specific.",
-                        ),
-                    )
-
-    for filename, content in source_files.items():
-        if not filename.lower().endswith(".py"):
-            continue
-
-        needs_device = False
-        has_device = re.search(r"^\s*device\s*=", content, flags=re.MULTILINE) is not None
-
-        for line in content.splitlines():
-            stripped = line.strip()
-            indent = line[: len(line) - len(line.lstrip())]
-
-            if stripped == 'os.environ["CUDA_HOME"] = "/usr/local/cuda"' or stripped.startswith('os.environ["CUDA_HOME"]'):
-                _append_unique_edit(
-                    edits,
-                    Edit(
-                        file=filename,
-                        original_block=line,
-                        replacement_block=f"{indent}# Removed CUDA_HOME override for ROCm portability: {stripped}",
-                        rationale="Avoid forcing CUDA toolkit paths in ROCm environments.",
-                    ),
-                )
-
-            if stripped.startswith("torch.cuda.set_device("):
-                _append_unique_edit(
-                    edits,
-                    Edit(
-                        file=filename,
-                        original_block=line,
-                        replacement_block=f'{indent}device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
-                        rationale="Replace hardcoded CUDA device selection with portable device detection.",
-                    ),
-                )
-                has_device = True
-
-            if re.search(r"\bload_in_(?:4bit|8bit)\s*=\s*True\b", stripped):
-                if stripped.startswith(("load_in_4bit", "load_in_8bit")):
-                    replacement_block = f"{indent}# Removed bitsandbytes quantization for ROCm review: {stripped}"
-                else:
-                    replacement_block = _remove_hf_bnb_quantization(line)
-                    replacement_block = re.sub(
-                        r"\bdevice_map\s*=\s*['\"]cuda['\"]",
-                        'device_map="auto"',
-                        replacement_block,
-                    )
-                _append_unique_edit(
-                    edits,
-                    Edit(
-                        file=filename,
-                        original_block=line,
-                        replacement_block=replacement_block,
-                        rationale="Remove Hugging Face bitsandbytes quantization because it requires CUDA-specific bitsandbytes.",
-                    ),
-                )
-
-            if re.search(r"\bdevice_map\s*=\s*['\"]cuda['\"]", stripped):
-                _append_unique_edit(
-                    edits,
-                    Edit(
-                        file=filename,
-                        original_block=line,
-                        replacement_block=f'{indent}device_map="auto",',
-                        rationale='Avoid pinning Hugging Face model loading to "cuda".',
-                    ),
-                )
-
-            if ".cuda()" in line and "torch.cuda." not in line:
-                replacement = line.replace(".cuda()", ".to(device)")
-                if replacement != line:
-                    needs_device = True
-                    _append_unique_edit(
-                        edits,
-                        Edit(
-                            file=filename,
-                            original_block=line,
-                            replacement_block=replacement,
-                            rationale="Replace direct .cuda() calls with device-aware .to(device).",
-                        ),
-                    )
-
-        if needs_device and not has_device and "import torch" in content:
-            _append_unique_edit(
-                edits,
-                Edit(
-                    file=filename,
-                    original_block="import torch",
-                    replacement_block='import torch\n\ndevice = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
-                    rationale="Define a portable torch device for migrated tensor and model moves.",
-                ),
-            )
-
-    if any(issue.get("pattern_id") == "hf_bitsandbytes_quant" for issue in issues):
-        note = (
-            "Removed Hugging Face load_in_4bit/load_in_8bit flags because they invoke "
-            "bitsandbytes quantization. On ROCm, use Optimum-AMD, AutoGPTQ, or serve "
-            "the model with vLLM instead."
-        )
-        if note not in commentary:
-            commentary = (commentary + "\n\n" if commentary else "") + note
-
-    if needs_bitsandbytes_fix:
-        note = (
-            "Removed Python bitsandbytes imports when detected so AMD QA can run; "
-            "code paths that actively call bitsandbytes APIs still require an Optimum-AMD "
-            "or AutoGPTQ replacement."
-        )
-        if note not in commentary:
-            commentary = (commentary + "\n\n" if commentary else "") + note
-
-    return MigrationOutput(edits=edits, new_files=migration.new_files, commentary=commentary)
-
-
-def _append_unique_edit(edits: list[Edit], edit: Edit) -> None:
-    for existing in edits:
-        if existing.file == edit.file and existing.original_block == edit.original_block:
-            return
-    edits.append(edit)
-
-
-def _remove_hf_bnb_quantization(line: str) -> str:
-    updated = re.sub(r",\s*load_in_(?:4bit|8bit)\s*=\s*True\s*,\s*", ", ", line)
-    updated = re.sub(r",\s*load_in_(?:4bit|8bit)\s*=\s*True", "", updated)
-    updated = re.sub(r"load_in_(?:4bit|8bit)\s*=\s*True\s*,\s*", "", updated)
-    return updated
 
 
 def _materialize_source_files(source_files: dict[str, str]) -> str:
