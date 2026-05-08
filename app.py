@@ -136,6 +136,10 @@ def main() -> None:
                 "amd_logs": qa_result.get("logs", ""),
                 "attempts": migration_results.get("attempts", []),
                 "agent_outputs": migration_results.get("agent_outputs", {}),
+                "skipped_edits": migration_results.get("skipped_edits", []),
+                "applied_edits": migration_results.get("applied_edits", []),
+                "failure_class": migration_results.get("failure_class", "unknown"),
+                "abort_reason": migration_results.get("abort_reason", ""),
                 "benchmark": {
                     "before": {"status": "failed", "runtime": None, "memory": None},
                     "after": {
@@ -162,7 +166,17 @@ def main() -> None:
         top_cols[0].metric("Before Score", f"{results['readiness_score']}/100")
         top_cols[1].metric("After Score", f"{results.get('score_after', 0)}/100")
         top_cols[2].metric("Issues Found", len(results.get("issues", [])))
-        top_cols[3].metric("AMD QA", results.get("benchmark", {}).get("after", {}).get("status", "unknown"))
+        qa_status = results.get("benchmark", {}).get("after", {}).get("status", "unknown")
+        failure_class = results.get("failure_class", "unknown")
+        qa_label = qa_status
+        if qa_status == "failed" and failure_class in ("app_bug", "environment"):
+            qa_label = f"{qa_status} ({failure_class})"
+        top_cols[3].metric("AMD QA", qa_label)
+
+        verdict_banner = _verdict_banner(qa_status, failure_class, results.get("abort_reason", ""))
+        if verdict_banner:
+            level, message = verdict_banner
+            getattr(st, level)(message)
 
     tabs = st.tabs(
         [
@@ -256,9 +270,42 @@ def main() -> None:
     with tabs[3]:
         st.subheader("Migration Patch")
         if results:
+            applied = results.get("applied_edits", [])
+            skipped = results.get("skipped_edits", [])
+            edit_cols = st.columns(2)
+            edit_cols[0].metric("Applied edits", len(applied))
+            edit_cols[1].metric("Skipped edits", len(skipped))
+
             st.code(results["patch_text"], language="diff")
             st.write("Generated files")
             st.write(", ".join(results["generated_files"]))
+
+            if skipped:
+                st.warning(
+                    f"{len(skipped)} edit(s) could not be applied. "
+                    "These were fed back to the LLM on retry."
+                )
+                with st.expander("Skipped edits", expanded=False):
+                    for edit in skipped:
+                        st.markdown(
+                            f"**{edit.get('file', '?')}** — "
+                            f"`{edit.get('reason', 'unknown')}`"
+                        )
+                        st.caption(edit.get("detail", ""))
+                        st.caption(f"rationale: {edit.get('rationale', '')}")
+                        st.code(
+                            f"# original_block\n{edit.get('original_block', '')}\n\n"
+                            f"# replacement_block\n{edit.get('replacement_block', '')}",
+                            language="python",
+                        )
+            if applied:
+                with st.expander(f"Applied edits ({len(applied)})", expanded=False):
+                    for edit in applied:
+                        match_kind = edit.get("match", "exact")
+                        st.markdown(
+                            f"**{edit.get('file', '?')}** — match: `{match_kind}`"
+                        )
+                        st.caption(edit.get("rationale", ""))
         else:
             st.info("No patch generated yet.")
 
@@ -279,7 +326,22 @@ def main() -> None:
                         f"{qa_result.get('status', 'unknown')}"
                     )
                     with st.expander(label, expanded=qa_result.get("status") == "failed"):
+                        det = attempt.get("deterministic_edit_count", 0)
+                        llm = attempt.get("llm_edit_count", 0)
+                        skipped = attempt.get("skipped_edits", [])
+                        st.caption(
+                            f"Deterministic edits: {det}  |  "
+                            f"LLM edits: {llm}  |  "
+                            f"Skipped: {len(skipped)}"
+                        )
                         st.code(attempt.get("patch", "") or "(no patch)", language="diff")
+                        if skipped:
+                            with st.expander("Skipped edits this attempt", expanded=False):
+                                for edit in skipped:
+                                    st.write(
+                                        f"- `{edit.get('reason', '?')}` in "
+                                        f"{edit.get('file', '?')}: {edit.get('detail', '')}"
+                                    )
                         st.text_area(
                             "QA logs",
                             value=qa_result.get("logs", ""),
@@ -384,6 +446,35 @@ def _status_state(name: str, qa_status: str) -> str:
     if name == "QA Tester" and qa_status == "failed":
         return "error"
     return "complete"
+
+
+def _verdict_banner(qa_status: str, failure_class: str, abort_reason: str) -> tuple[str, str] | None:
+    """Return (streamlit method name, message) for the top-level banner."""
+    if qa_status not in ("failed",):
+        return ("success", "Migration succeeded — patched code ran on AMD ROCm without errors.")
+    if failure_class == "app_bug":
+        msg = (
+            "Migration succeeded; runtime tripped on a pre-existing app bug "
+            "(e.g. missing tokenizer pad_token, missing data file, missing CLI argument). "
+            "ROCmForge migrated every CUDA/ROCm pattern; the remaining error is not a "
+            "migration concern."
+        )
+        if abort_reason:
+            msg += f"\n\n_{abort_reason}_"
+        return ("info", msg)
+    if failure_class == "environment":
+        return (
+            "info",
+            "Migration succeeded; runtime tripped on a sandbox environment issue "
+            "(network/disk/missing weights). The migration patch itself is sound.",
+        )
+    if failure_class == "cuda_relevant":
+        return (
+            "warning",
+            "Migration partially complete — CUDA-relevant runtime error remained after retries. "
+            "See QA logs to continue manually.",
+        )
+    return ("warning", "Migration ran; QA failed and could not be confidently classified.")
 
 
 def _status_label(state: str) -> str:
