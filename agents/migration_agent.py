@@ -446,9 +446,26 @@ def _build_prompt(
         )
         sections.append("")
 
-    sections.append("Source files JSON (filename -> content):")
-    sections.append(json.dumps(source_files, ensure_ascii=True))
-    sections.append("")
+    relevant_sources = _select_relevant_sources(
+        unhandled_issues=unhandled_issues,
+        source_files=source_files,
+        qa_feedback=qa_feedback,
+        previous_skipped_edits=previous_skipped_edits,
+    )
+    if relevant_sources:
+        sections.append(
+            "Source files JSON (filename -> content) — ONLY files that have "
+            "a residual issue or were named in QA feedback are included:"
+        )
+        sections.append(json.dumps(relevant_sources, ensure_ascii=True))
+        sections.append("")
+    else:
+        sections.append(
+            "No source files require LLM editing — every issue is either "
+            "handled deterministically or the QA feedback can be addressed "
+            "without further code changes."
+        )
+        sections.append("")
 
     if previous_patch:
         sections.append(
@@ -492,6 +509,58 @@ def _build_prompt(
         "\"new_files\": {filename: content}, \"commentary\": \"...\"}."
     )
     return "\n".join(sections)
+
+
+_PER_FILE_SOURCE_CAP = 8000  # characters; keeps the prompt bounded
+
+
+def _select_relevant_sources(
+    unhandled_issues: list[dict],
+    source_files: dict[str, str],
+    qa_feedback: str,
+    previous_skipped_edits: list[dict],
+) -> dict[str, str]:
+    """Return only the source files the LLM needs to see.
+
+    Includes:
+        - Files that own at least one residual issue.
+        - Files explicitly named in the QA feedback (e.g. traceback paths).
+        - Files referenced by skipped edits from the previous attempt.
+    Each file's content is capped at _PER_FILE_SOURCE_CAP characters to keep
+    prompts bounded for big repos.
+    """
+    relevant_keys: set[str] = set()
+
+    for issue in unhandled_issues:
+        raw = str(issue.get("file", ""))
+        key = _resolve_to_source_key(raw, source_files)
+        if key is not None:
+            relevant_keys.add(key)
+
+    if qa_feedback:
+        # Crude but effective: any source_files key whose name appears in the
+        # feedback string is included.
+        for key in source_files:
+            base = key.rsplit("/", 1)[-1]
+            if base and base in qa_feedback:
+                relevant_keys.add(key)
+
+    for sk in previous_skipped_edits:
+        raw = str(sk.get("file", ""))
+        key = _resolve_to_source_key(raw, source_files)
+        if key is not None:
+            relevant_keys.add(key)
+
+    if not relevant_keys:
+        return {}
+
+    out: dict[str, str] = {}
+    for key in sorted(relevant_keys):
+        content = source_files.get(key, "")
+        if len(content) > _PER_FILE_SOURCE_CAP:
+            content = content[:_PER_FILE_SOURCE_CAP] + "\n# ... (truncated by ROCmForge)"
+        out[key] = content
+    return out
 
 
 def _render_issue_checklist(issues: list[dict]) -> str:

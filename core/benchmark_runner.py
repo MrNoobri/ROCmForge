@@ -240,14 +240,45 @@ def _host_run_command(remote_dir: str, entrypoint: str) -> str:
 
 
 def _run_shell_body(remote_dir: str, entrypoint: str) -> str:
+    quoted_dir = shlex.quote(remote_dir)
     quoted_entrypoint = shlex.quote(entrypoint)
     return (
-        f"cd {shlex.quote(remote_dir)} && "
+        # Set up the working directory and Python binary.
+        f"cd {quoted_dir} && "
         f"PYTHON_BIN=$(command -v python3 || command -v python) && "
         f"$PYTHON_BIN -m venv --system-site-packages .venv && "
+
+        # Relax exact-pinned versions that commonly conflict with sandbox libs.
+        # We generate requirements-rocm.txt with >= bounds so pip can resolve
+        # upward instead of downgrading system packages.
         f"if [ -f requirements.txt ]; then "
-        f".venv/bin/pip install --no-cache-dir --quiet -r requirements.txt 2>&1; "
+        f"  python3 -c \""
+        f"import re, sys; "
+        f"RELAX = {{'pydantic','fastapi','uvicorn','starlette','transformers','tokenizers','accelerate','triton'}}; "
+        f"lines = open('requirements.txt').readlines(); "
+        f"out = []; "
+        f"[out.append(re.sub(r'==([0-9])', r'>=\\1', l) if any(l.lower().startswith(p) for p in RELAX) else l) for l in lines]; "
+        f"open('requirements-rocm.txt','w').writelines(out)"
+        f"\" 2>/dev/null || cp requirements.txt requirements-rocm.txt; "
+        f".venv/bin/pip install --no-cache-dir --quiet "
+        f"--upgrade-strategy only-if-needed "
+        f"-r requirements-rocm.txt 2>&1 || true; "
         f"fi && "
+
+        # src-layout: if there is a pyproject.toml/setup.py and a src/ dir,
+        # install the package itself so imports like `from mypackage.x import`
+        # resolve correctly. Fall back to setting PYTHONPATH=src.
+        f"if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then "
+        f"  if [ -d src ]; then "
+        f"    .venv/bin/pip install --no-cache-dir --quiet -e . 2>&1 || "
+        f"    export PYTHONPATH={quoted_dir}/src:${{PYTHONPATH:-}}; "
+        f"  else "
+        f"    .venv/bin/pip install --no-cache-dir --quiet -e . 2>&1 || true; "
+        f"  fi; "
+        f"elif [ -d src ]; then "
+        f"  export PYTHONPATH={quoted_dir}/src:${{PYTHONPATH:-}}; "
+        f"fi && "
+
         f"SECONDS=0 && "
         f".venv/bin/python {quoted_entrypoint} 2>&1; "
         f"exit_code=$?; echo $SECONDS; exit $exit_code"

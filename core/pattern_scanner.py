@@ -54,6 +54,11 @@ class Issue:
 _DOCKER_NVIDIA_RE = re.compile(r"nvidia/cuda", re.IGNORECASE)
 _REQ_CUDA_ONLY_RE = re.compile(r"^(bitsandbytes|flash-attn|nvidia-)\b", re.IGNORECASE)
 _REQ_TORCH_CU_RE = re.compile(r"\+cu\d{2,3}\b", re.IGNORECASE)
+# Packages commonly pinned too old for the ROCm sandbox (which ships vllm, newer pydantic, etc.)
+_REQ_PINNED_CONFLICT_RE = re.compile(
+    r"^(pydantic|fastapi|uvicorn|starlette|transformers|tokenizers|accelerate)==",
+    re.IGNORECASE,
+)
 _NVCC_RE = re.compile(r"\bnvcc\b", re.IGNORECASE)
 _CUDA_HOME_RE = re.compile(r"CUDA_HOME")
 _CUDA_VISIBLE_RE = re.compile(r"CUDA_VISIBLE_DEVICES")
@@ -172,6 +177,26 @@ def _scan_text(content: str, filename: str, *, full_path: str | None = None) -> 
             "docker_nvidia_base",
             "Dockerfile uses an NVIDIA CUDA base image.",
         )
+        for index, line in enumerate(lines, start=1):
+            if _is_comment_only(line, filename):
+                continue
+            stripped = line.strip()
+            if re.match(r"^ENV\s+CUDA_HOME\b", stripped):
+                add_issue(
+                    index,
+                    "medium",
+                    "docker_cuda_home",
+                    line,
+                    "Dockerfile sets CUDA_HOME; use ROCM_PATH for ROCm builds.",
+                )
+            elif re.match(r"^ENV\s+CUDA_VISIBLE_DEVICES\b", stripped):
+                add_issue(
+                    index,
+                    "medium",
+                    "docker_cuda_visible_devices",
+                    line,
+                    "Dockerfile sets CUDA_VISIBLE_DEVICES; ROCm uses HIP_VISIBLE_DEVICES.",
+                )
 
     if filename.lower() == "requirements.txt":
         for index, line in enumerate(lines, start=1):
@@ -191,6 +216,14 @@ def _scan_text(content: str, filename: str, *, full_path: str | None = None) -> 
                     "dep_torch_cuda_wheel",
                     line,
                     "PyTorch wheel pinned to a CUDA build (+cuXXX); replace with the ROCm wheel index.",
+                )
+            elif _REQ_PINNED_CONFLICT_RE.search(stripped):
+                add_issue(
+                    index,
+                    "medium",
+                    "dep_pinned_version_conflict",
+                    line,
+                    "Hard-pinned version (==) may conflict with ROCm sandbox packages; relax to >= bound.",
                 )
 
     if filename.upper().startswith("README"):
@@ -247,6 +280,8 @@ def _scan_text(content: str, filename: str, *, full_path: str | None = None) -> 
             "CUDA_VISIBLE_DEVICES is set; ROCm uses HIP_VISIBLE_DEVICES (or ROCR_VISIBLE_DEVICES).",
         )
         for index, line in enumerate(lines, start=1):
+            if _is_comment_only(line, filename):
+                continue
             if _NVIDIA_SMI_BARE_CALL_RE.search(line) and _is_likely_subprocess_arg(lines, index - 1):
                 add_issue(
                     index,
@@ -261,12 +296,20 @@ def _scan_text(content: str, filename: str, *, full_path: str | None = None) -> 
             "pytorch_to_cuda_string",
             'Tensor/model uses .to("cuda") instead of a portable device variable.',
         )
-        scan_regex(
-            _DEVICE_EQ_CUDA_RE,
-            "medium",
-            "device_string_cuda",
-            'device variable hardcoded to "cuda"; use torch.cuda.is_available() check.',
-        )
+        for index, line in enumerate(lines, start=1):
+            if _is_comment_only(line, filename):
+                continue
+            if "is_available" in line:
+                # Already a portable check (e.g. torch.cuda.is_available()).
+                continue
+            if _DEVICE_EQ_CUDA_RE.search(line):
+                add_issue(
+                    index,
+                    "medium",
+                    "device_string_cuda",
+                    line,
+                    'device variable hardcoded to "cuda"; use torch.cuda.is_available() check.',
+                )
         scan_regex(
             _TORCH_DTYPE_F16_RE,
             "low",
