@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import sys
+import time
 import tomllib
 import uuid
 from pathlib import Path
@@ -191,7 +192,7 @@ def _run_remote(
     finally:
         sftp.close()
 
-    # Capture GPU memory before run
+    # Capture GPU memory baseline before run (from idle GPU)
     mem_before = _gpu_memory_gb(ssh)
 
     container = _get_config(_ENV_CONTAINER, "rocm")
@@ -200,16 +201,15 @@ def _run_remote(
     else:
         run_cmd = _host_run_command(remote_dir, entrypoint)
 
-    try:
-        _, stdout, stderr = ssh.exec_command(run_cmd, timeout=timeout_sec)
-        exit_code = stdout.channel.recv_exit_status()
-        logs = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        if err:
-            logs += f"\nSTDERR:\n{err}"
-    except Exception as exc:
+    # Run the command while sampling rocm-smi in parallel to capture peak VRAM
+    run_result, peak_mem = _peak_gpu_memory_during(ssh, run_cmd, timeout_sec)
+
+    if run_result.get("error"):
         _cleanup_remote(ssh, remote_dir)
-        return _failed(f"Remote execution error: {exc}")
+        return _failed(f"Remote execution error: {run_result['error']}")
+
+    exit_code = run_result["exit_code"]
+    logs = run_result["logs"]
 
     # Extract runtime from /usr/bin/time output (last line is elapsed seconds)
     runtime_sec = 0.0
@@ -220,8 +220,14 @@ def _run_remote(
         except ValueError:
             continue
 
-    mem_after = _gpu_memory_gb(ssh)
-    gpu_memory_gb = max(0.0, mem_after - mem_before)
+    # Peak VRAM during run minus the idle baseline gives the run's actual usage.
+    # If sampler captured nothing (small/fast script), fall back to peak alone.
+    if peak_mem > 0:
+        gpu_memory_gb = max(0.0, peak_mem - mem_before)
+        if gpu_memory_gb < 0.05:  # very small jobs: just report peak
+            gpu_memory_gb = peak_mem
+    else:
+        gpu_memory_gb = 0.0
 
     # Always clean up — even on failure
     _cleanup_remote(ssh, remote_dir)
@@ -258,16 +264,69 @@ def _sftp_mkdir(sftp, path: str) -> None:
 
 
 def _gpu_memory_gb(ssh) -> float:
-    """Query rocm-smi for VRAM used on card0. Returns 0.0 on any failure."""
+    """Query rocm-smi for VRAM used on card0. Returns 0.0 on any failure.
+
+    Tries the rocm container first (where the ROCm tooling lives), then host.
+    """
+    container = _get_config(_ENV_CONTAINER, "rocm")
+
+    cmds = []
+    if container:
+        cmds.append(f"docker exec {shlex.quote(container)} rocm-smi --showmeminfo vram --json")
+    cmds.append("rocm-smi --showmeminfo vram --json")
+
+    for cmd in cmds:
+        try:
+            _, stdout, _ = ssh.exec_command(cmd, timeout=10)
+            raw = stdout.read().decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            data = json.loads(raw)
+            card = next(iter(data.values()))
+            # Different rocm-smi versions use different keys
+            for key in (
+                "VRAM Total Used Memory (B)",
+                "VRAM Used Memory (B)",
+                "GPU Memory Used (B)",
+                "Used Memory (B)",
+            ):
+                if key in card:
+                    return int(card[key]) / (1024 ** 3)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _peak_gpu_memory_during(ssh, run_cmd: str, timeout_sec: int) -> tuple[dict, float]:
+    """Run the command while sampling rocm-smi every 0.5s in parallel.
+
+    Returns (run_result_dict, peak_memory_gb).
+    The run_result_dict has the same shape as the existing exec output.
+    """
+    import threading
+    peak = {"gb": 0.0, "stop": False}
+
+    def _sampler():
+        while not peak["stop"]:
+            mem = _gpu_memory_gb(ssh)
+            if mem > peak["gb"]:
+                peak["gb"] = mem
+            time.sleep(0.5)
+
+    sampler_thread = threading.Thread(target=_sampler, daemon=True)
+    sampler_thread.start()
     try:
-        _, stdout, _ = ssh.exec_command("rocm-smi --showmeminfo vram --json", timeout=10)
-        raw = stdout.read().decode("utf-8", errors="replace").strip()
-        data = json.loads(raw)
-        card = next(iter(data.values()))  # first GPU
-        used_bytes = int(card.get("VRAM Total Used Memory (B)", 0))
-        return used_bytes / (1024 ** 3)
-    except Exception:
-        return 0.0
+        _, stdout, stderr = ssh.exec_command(run_cmd, timeout=timeout_sec)
+        exit_code = stdout.channel.recv_exit_status()
+        logs = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        if err:
+            logs += f"\nSTDERR:\n{err}"
+        return ({"exit_code": exit_code, "logs": logs, "error": None}, peak["gb"])
+    except Exception as exc:
+        return ({"exit_code": -1, "logs": "", "error": str(exc)}, peak["gb"])
+    finally:
+        peak["stop"] = True
 
 
 def _is_encrypted_key_error(exc: Exception) -> bool:
@@ -302,16 +361,24 @@ def _run_shell_body(remote_dir: str, entrypoint: str) -> str:
         f"PYTHON_BIN=$(command -v python3 || command -v python) && "
         f"$PYTHON_BIN -m venv --system-site-packages .venv && "
 
-        # Relax exact-pinned versions that commonly conflict with sandbox libs.
-        # We generate requirements-rocm.txt with >= bounds so pip can resolve
-        # upward instead of downgrading system packages.
+        # Relax exact-pinned versions that commonly conflict with sandbox libs,
+        # AND drop torch/torchvision/torchaudio entirely — those must come from
+        # the rocm container's system site-packages, otherwise pip pulls the CPU
+        # PyPI wheel and breaks torchvision::nms (mismatched torch/torchvision).
         f"if [ -f requirements.txt ]; then "
         f"  python3 -c \""
-        f"import re, sys; "
+        f"import re; "
         f"RELAX = {{'pydantic','fastapi','uvicorn','starlette','transformers','tokenizers','accelerate','triton'}}; "
+        f"DROP = ('torch','torchvision','torchaudio','triton'); "
         f"lines = open('requirements.txt').readlines(); "
         f"out = []; "
-        f"[out.append(re.sub(r'==([0-9])', r'>=\\1', l) if any(l.lower().startswith(p) for p in RELAX) else l) for l in lines]; "
+        f"def keep(l):"
+        f" name = re.split(r'[\\s<>=!~;\\[]', l.strip().lower(), 1)[0];"
+        f" return not any(name == d or name.startswith(d + '+') for d in DROP); "
+        f"def relax(l):"
+        f" name = re.split(r'[\\s<>=!~;\\[]', l.strip().lower(), 1)[0];"
+        f" return re.sub(r'==([0-9])', r'>=\\1', l) if name in RELAX else l; "
+        f"[out.append(relax(l)) for l in lines if keep(l)]; "
         f"open('requirements-rocm.txt','w').writelines(out)"
         f"\" 2>/dev/null || cp requirements.txt requirements-rocm.txt; "
         f".venv/bin/pip install --no-cache-dir --quiet "
