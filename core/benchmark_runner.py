@@ -353,55 +353,72 @@ def _host_run_command(remote_dir: str, entrypoint: str) -> str:
 
 
 def _run_shell_body(remote_dir: str, entrypoint: str) -> str:
+    """Build the bash script that installs deps and runs the user's entrypoint.
+
+    Strategy: do NOT create a venv. The rocm container already has a fully
+    working torch+torchvision+transformers stack. Creating a venv (even with
+    --system-site-packages) causes pip to install a CPU-only torch wheel that
+    shadows the container's ROCm torch, leading to torch/torchvision version
+    mismatches (e.g. `operator torchvision::nms does not exist`).
+
+    Instead we install the user's missing deps directly into the system, but
+    skip torch/torchvision/torchaudio/triton (which are already present and
+    correctly paired with the ROCm runtime).
+    """
     quoted_dir = shlex.quote(remote_dir)
     quoted_entrypoint = shlex.quote(entrypoint)
     return (
-        # Set up the working directory and Python binary.
         f"cd {quoted_dir} && "
         f"PYTHON_BIN=$(command -v python3 || command -v python) && "
-        f"$PYTHON_BIN -m venv --system-site-packages .venv && "
 
-        # Relax exact-pinned versions that commonly conflict with sandbox libs,
-        # AND drop torch/torchvision/torchaudio entirely — those must come from
-        # the rocm container's system site-packages, otherwise pip pulls the CPU
-        # PyPI wheel and breaks torchvision::nms (mismatched torch/torchvision).
+        # Build a filtered requirements file: drop torch/torchvision/torchaudio/triton
+        # and relax common pinned deps that conflict with the sandbox.
         f"if [ -f requirements.txt ]; then "
-        f"  python3 -c \""
+        f"  $PYTHON_BIN -c \""
         f"import re; "
-        f"RELAX = {{'pydantic','fastapi','uvicorn','starlette','transformers','tokenizers','accelerate','triton'}}; "
+        f"RELAX = {{'pydantic','fastapi','uvicorn','starlette','transformers','tokenizers','accelerate'}}; "
         f"DROP = ('torch','torchvision','torchaudio','triton'); "
         f"lines = open('requirements.txt').readlines(); "
         f"out = []; "
-        f"def keep(l):"
-        f" name = re.split(r'[\\s<>=!~;\\[]', l.strip().lower(), 1)[0];"
-        f" return not any(name == d or name.startswith(d + '+') for d in DROP); "
-        f"def relax(l):"
-        f" name = re.split(r'[\\s<>=!~;\\[]', l.strip().lower(), 1)[0];"
-        f" return re.sub(r'==([0-9])', r'>=\\1', l) if name in RELAX else l; "
-        f"[out.append(relax(l)) for l in lines if keep(l)]; "
-        f"open('requirements-rocm.txt','w').writelines(out)"
-        f"\" 2>/dev/null || cp requirements.txt requirements-rocm.txt; "
-        f".venv/bin/pip install --no-cache-dir --quiet "
-        f"--upgrade-strategy only-if-needed "
-        f"-r requirements-rocm.txt 2>&1 || true; "
+        f"\\n"
+        f"def keep(l):\\n"
+        f"    s = l.strip().lower()\\n"
+        f"    if not s or s.startswith('#') or s.startswith('-'): return True\\n"
+        f"    name = re.split(r'[\\s<>=!~;\\[]', s, 1)[0]\\n"
+        f"    return not any(name == d for d in DROP)\\n"
+        f"\\n"
+        f"def relax(l):\\n"
+        f"    s = l.strip().lower()\\n"
+        f"    if not s or s.startswith('#'): return l\\n"
+        f"    name = re.split(r'[\\s<>=!~;\\[]', s, 1)[0]\\n"
+        f"    return re.sub(r'==([0-9])', r'>=\\\\1', l) if name in RELAX else l\\n"
+        f"\\n"
+        f"for l in lines:\\n"
+        f"    if keep(l): out.append(relax(l))\\n"
+        f"open('requirements-rocm.txt','w').writelines(out)\" 2>/dev/null "
+        f"  || (grep -ivE '^[[:space:]]*(torch|torchvision|torchaudio|triton)([[:space:]]|=|<|>|!|~|;|\\[|$)' requirements.txt > requirements-rocm.txt || cp requirements.txt requirements-rocm.txt); "
+        f"  $PYTHON_BIN -m pip install --no-cache-dir --quiet --break-system-packages "
+        f"    --upgrade-strategy only-if-needed "
+        f"    -r requirements-rocm.txt 2>&1 || true; "
         f"fi && "
 
         # src-layout: if there is a pyproject.toml/setup.py and a src/ dir,
         # install the package itself so imports like `from mypackage.x import`
-        # resolve correctly. Fall back to setting PYTHONPATH=src.
+        # resolve. Fall back to PYTHONPATH=src.
         f"if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then "
         f"  if [ -d src ]; then "
-        f"    .venv/bin/pip install --no-cache-dir --quiet -e . 2>&1 || "
+        f"    $PYTHON_BIN -m pip install --no-cache-dir --quiet --break-system-packages --no-deps -e . 2>&1 || "
         f"    export PYTHONPATH={quoted_dir}/src:${{PYTHONPATH:-}}; "
         f"  else "
-        f"    .venv/bin/pip install --no-cache-dir --quiet -e . 2>&1 || true; "
+        f"    $PYTHONPATH={quoted_dir}:${{PYTHONPATH:-}}; "
         f"  fi; "
         f"elif [ -d src ]; then "
         f"  export PYTHONPATH={quoted_dir}/src:${{PYTHONPATH:-}}; "
         f"fi && "
 
+        f"export PYTHONPATH={quoted_dir}:{quoted_dir}/src:${{PYTHONPATH:-}} && "
         f"SECONDS=0 && "
-        f".venv/bin/python {quoted_entrypoint} 2>&1; "
+        f"$PYTHON_BIN {quoted_entrypoint} 2>&1; "
         f"exit_code=$?; echo $SECONDS; exit $exit_code"
     )
 
