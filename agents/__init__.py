@@ -383,6 +383,15 @@ def _runtime_issues_from_qa(qa_result: dict) -> list[dict]:
     # Environment/host issues (not migration issues either).
     env_signals: list[tuple[re.Pattern[str], str, str]] = [
         (
+            re.compile(
+                r"SSH connection error:.*(?:Private key file is encrypted|"
+                r"Could not decrypt SSH key|Authentication failed|No authentication methods available)",
+                re.IGNORECASE,
+            ),
+            "runtime_env_ssh_key",
+            "Sandbox SSH authentication failed; check AMD_SANDBOX_KEY_PATH and AMD_SANDBOX_KEY_PASSPHRASE.",
+        ),
+        (
             re.compile(r"OSError:.*Network is unreachable|ConnectionError|HTTPError|requests\.exceptions"),
             "runtime_env_network",
             "Sandbox could not reach the network (model download, dataset fetch, etc.).",
@@ -425,6 +434,7 @@ NON_MIGRATION_PATTERNS = frozenset(
         "runtime_app_bug_logic",
         "runtime_env_network",
         "runtime_env_disk_full",
+        "runtime_env_ssh_key",
     }
 )
 

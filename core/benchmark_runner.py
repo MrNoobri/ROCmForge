@@ -45,14 +45,20 @@ def _get_config(key: str, default: str = "") -> str:
     if value:
         return value
 
-    secrets_path = Path(".streamlit") / "secrets.toml"
+    secrets_path = Path.cwd() / ".streamlit" / "secrets.toml"
     if secrets_path.exists():
         try:
             data = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
             value = str(data.get(key, "")).strip()
             if value:
                 return value
-        except Exception:
+        except tomllib.TOMLDecodeError as exc:
+            raise EnvironmentError(
+                f"Could not parse {secrets_path}. For Windows paths in TOML, "
+                "use single quotes or escape backslashes, for example "
+                r'AMD_SANDBOX_KEY_PATH = "C:\\Users\\noobr\\.ssh\\id_ed25519".'
+            ) from exc
+        except OSError:
             pass
 
     try:
@@ -130,12 +136,12 @@ def run_on_amd(
                 resolved_key_path = str(Path(key_path).expanduser())
                 pkey = None
                 last_exc: Exception | None = None
-                for loader in (
-                    paramiko.Ed25519Key,
-                    paramiko.RSAKey,
-                    paramiko.ECDSAKey,
-                    paramiko.DSSKey,
-                ):
+                # Try common key types — DSSKey was removed in newer paramiko.
+                loaders = []
+                for attr in ("Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey"):
+                    if hasattr(paramiko, attr):
+                        loaders.append(getattr(paramiko, attr))
+                for loader in loaders:
                     try:
                         pkey = loader.from_private_key_file(resolved_key_path, password=key_passphrase)
                         break
@@ -160,7 +166,10 @@ def run_on_amd(
             timeout_sec=timeout_sec,
         )
     except Exception as exc:
-        return _failed(f"SSH connection error: {exc}")
+        return _failed(
+            "SSH connection error: "
+            f"{_format_ssh_connection_error(exc, key_path=key_path, key_passphrase=key_passphrase)}"
+        )
     finally:
         try:
             ssh.close()
@@ -259,6 +268,25 @@ def _gpu_memory_gb(ssh) -> float:
         return used_bytes / (1024 ** 3)
     except Exception:
         return 0.0
+
+
+def _is_encrypted_key_error(exc: Exception) -> bool:
+    """Return True for Paramiko/OpenSSH errors caused by a passphrase-protected key."""
+    message = str(exc).lower()
+    return "private key file is encrypted" in message or (
+        "encrypted" in message and "passphrase" in message
+    )
+
+
+def _format_ssh_connection_error(exc: Exception, key_path: str, key_passphrase: str) -> str:
+    """Make common SSH configuration failures actionable for the Streamlit report."""
+    if key_path and not key_passphrase and _is_encrypted_key_error(exc):
+        return (
+            f"{exc}. The SSH key at {key_path!r} is passphrase-protected, but "
+            f"{_ENV_KEY_PASSPHRASE} is not set. Add the key passphrase to "
+            ".streamlit/secrets.toml, Streamlit Cloud secrets, or .env."
+        )
+    return str(exc)
 
 
 def _host_run_command(remote_dir: str, entrypoint: str) -> str:

@@ -187,9 +187,9 @@ def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> N
         worker.start()
 
         # All 6 agents shown in parallel 3x2 grid with streaming demo logs.
-        # Logs scroll independently per agent. We re-render the panel until
-        # the worker thread finishes.
-        progress_slot = st.container()
+        # Use st.empty() (a true single-slot placeholder) so each render REPLACES
+        # the previous one — st.container() would stack them.
+        progress_slot = st.empty()
 
         # Demo log lines per agent (streamed in over time)
         demo_logs = {
@@ -242,59 +242,57 @@ def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> N
         }
 
         def render_progress(progress_per_agent, all_done):
-            """Re-render the parallel progress grid."""
-            progress_slot.empty()
-            with progress_slot:
-                cards_html = []
-                completed_count = 0
-                for name in agent_names:
-                    p = progress_per_agent[name]
-                    log_lines = demo_logs[name]
-                    visible = log_lines[: max(1, int(p * len(log_lines)))]
-                    is_done = p >= 1.0
-                    if is_done:
-                        completed_count += 1
-                    state_cls = "pp-card--done" if is_done else "pp-card--running"
-                    dot = "<span class='pp-dot pp-dot--done'>&#10003;</span>" if is_done else "<span class='pp-dot pp-dot--running'></span>"
-                    tag_cls = "pp-tag--done" if is_done else "pp-tag--running"
-                    tag_text = "COMPLETE" if is_done else "RUNNING"
+            """Re-render the parallel progress grid in-place via the placeholder."""
+            cards_html = []
+            completed_count = 0
+            for name in agent_names:
+                p = progress_per_agent[name]
+                log_lines = demo_logs[name]
+                visible = log_lines[: max(1, int(p * len(log_lines)))]
+                is_done = p >= 1.0
+                if is_done:
+                    completed_count += 1
+                state_cls = "pp-card--done" if is_done else "pp-card--running"
+                dot = "<span class='pp-dot pp-dot--done'>&#10003;</span>" if is_done else "<span class='pp-dot pp-dot--running'></span>"
+                tag_cls = "pp-tag--done" if is_done else "pp-tag--running"
+                tag_text = "COMPLETE" if is_done else "RUNNING"
 
-                    log_html = "".join(
-                        f"<div class='pp-log-line'>&gt; {html.escape(line)}</div>"
-                        for line in visible
-                    )
-
-                    cards_html.append(
-                        f"<div class='pp-card {state_cls}'>"
-                        f"<div class='pp-card__head'>"
-                        f"{dot}"
-                        f"<div class='pp-card__name'>{html.escape(name)}</div>"
-                        f"<span class='pp-tag {tag_cls}'>{tag_text}</span>"
-                        f"</div>"
-                        f"<div class='pp-card__desc'>{html.escape(agent_descriptions[name])}</div>"
-                        f"<div class='pp-log'>{log_html}</div>"
-                        f"</div>"
-                    )
-
-                pct = int((completed_count / len(agent_names)) * 100) if all_done else int(
-                    (sum(progress_per_agent.values()) / len(agent_names)) * 100
+                log_html = "".join(
+                    f"<div class='pp-log-line'>&gt; {html.escape(line)}</div>"
+                    for line in visible
                 )
-                pct = min(100, max(0, pct))
 
-                st.markdown(
-                    "<div class='pp-panel'>"
-                    "<div class='pp-panel__head'>"
-                    "<div>"
-                    "<div class='pp-panel__kicker'>AMD &middot; MI300X &middot; Multi-Agent Orchestration</div>"
-                    "<div class='pp-panel__title'>Migration in Progress</div>"
-                    "</div>"
-                    f"<div class='pp-panel__pct'>{pct}%</div>"
-                    "</div>"
-                    f"<div class='pp-bar'><div class='pp-bar__fill' style='width:{pct}%'></div></div>"
-                    f"<div class='pp-grid'>{''.join(cards_html)}</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
+                cards_html.append(
+                    f"<div class='pp-card {state_cls}'>"
+                    f"<div class='pp-card__head'>"
+                    f"{dot}"
+                    f"<div class='pp-card__name'>{html.escape(name)}</div>"
+                    f"<span class='pp-tag {tag_cls}'>{tag_text}</span>"
+                    f"</div>"
+                    f"<div class='pp-card__desc'>{html.escape(agent_descriptions[name])}</div>"
+                    f"<div class='pp-log'>{log_html}</div>"
+                    f"</div>"
                 )
+
+            pct = int((completed_count / len(agent_names)) * 100) if all_done else int(
+                (sum(progress_per_agent.values()) / len(agent_names)) * 100
+            )
+            pct = min(100, max(0, pct))
+
+            progress_slot.markdown(
+                "<div class='pp-panel'>"
+                "<div class='pp-panel__head'>"
+                "<div>"
+                "<div class='pp-panel__kicker'>AMD &middot; MI300X &middot; Multi-Agent Orchestration</div>"
+                "<div class='pp-panel__title'>Migration in Progress</div>"
+                "</div>"
+                f"<div class='pp-panel__pct'>{pct}%</div>"
+                "</div>"
+                f"<div class='pp-bar'><div class='pp-bar__fill' style='width:{pct}%'></div></div>"
+                f"<div class='pp-grid'>{''.join(cards_html)}</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
         # Each agent has its own progress 0..1. Different speeds keep it lively.
         agent_speeds = {
