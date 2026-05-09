@@ -48,14 +48,13 @@ _QA_APP_BUG_BONUS = 25  # Migration succeeded; pre-existing app bug remains.
 _QA_FAILED_PENALTY = 10  # Reduced from 20 — the issue penalties already reflect quality.
 
 
-def score(issues: list[Issue], qa_result: dict) -> int:
-    """Compute readiness score from issues and QA result.
+def _static_penalty_total(issues: list[Issue]) -> int:
+    """Sum penalties for unique pattern_ids (multi-count families are counted per-occurrence).
 
-    The score is computed as: 100 - (sum of static-issue penalties) +
-    (AMD QA bonus). Issues are deduplicated per pattern except for the
-    multi-count families (e.g. each CUDA-only dep counts separately).
+    Penalties are also softened with diminishing returns so a deeply CUDA-coupled
+    repo doesn't crater to 0 — that hides the actual improvement after migration.
     """
-    total = 100
+    total = 0
     seen: set[str] = set()
     for issue in issues:
         pid = issue.pattern_id
@@ -63,12 +62,30 @@ def score(issues: list[Issue], qa_result: dict) -> int:
         if penalty is None:
             continue
         if pid in _MULTI_COUNT_PATTERNS:
-            total -= penalty
+            total += penalty
             continue
         if pid in seen:
             continue
         seen.add(pid)
-        total -= penalty
+        total += penalty
+    return total
+
+
+def _diminishing(raw_penalty: int, ceiling: int = 70) -> int:
+    """Apply a soft cap so penalties saturate near a ceiling instead of clamping at 0.
+
+    Maps raw penalty x to ceiling * (1 - exp(-x / ceiling)). For x=20 → ~17,
+    x=50 → ~35, x=150 → ~62. Keeps the Before score meaningfully above 0 even
+    on heavily CUDA-coupled repos so the After delta is visible.
+    """
+    import math
+    return int(round(ceiling * (1 - math.exp(-raw_penalty / ceiling))))
+
+
+def score(issues: list[Issue], qa_result: dict) -> int:
+    """Compute readiness score from issues and QA result."""
+    raw = _static_penalty_total(issues)
+    total = 100 - _diminishing(raw)
 
     status = qa_result.get("status")
     if status == "failed":
@@ -78,16 +95,20 @@ def score(issues: list[Issue], qa_result: dict) -> int:
     elif status in ("passed", "success", "ok"):
         total += _QA_PASS_BONUS
     elif status is not None and status != "unknown":
-        # Treat any other non-failure status as a pass (the sandbox returned
-        # output and didn't classify as failed).
         total += _QA_PASS_BONUS
 
     return max(min(total, 100), 0)
 
 
 def score_before(issues: list[Issue]) -> int:
-    """Score before any migration: assume QA would have failed on AMD."""
-    return score(issues, {"status": "failed"})
+    """Score before migration: portability of the repo as-is, no QA bonus/penalty.
+
+    This is a static measure — how AMD-portable does this codebase look right
+    now? We do NOT apply the QA-failed penalty because Before is hypothetical
+    (the repo never ran on AMD pre-migration).
+    """
+    raw = _static_penalty_total(issues)
+    return max(0, 100 - _diminishing(raw))
 
 
 def score_after(issues: list[Issue], qa_result: dict) -> int:
