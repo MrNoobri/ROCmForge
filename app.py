@@ -186,66 +186,155 @@ def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> N
             pass
         worker.start()
 
-        # Live agent progression: each agent flips queued → running → done in sequence.
-        # Use a SINGLE container that we re-render into; never call .empty() on it
-        # mid-run (causes Streamlit to escape subsequent HTML).
+        # All 6 agents shown in parallel 3x2 grid with streaming demo logs.
+        # Logs scroll independently per agent. We re-render the panel until
+        # the worker thread finishes.
         progress_slot = st.container()
-        agent_states = {name: "queued" for name in agent_names}
-        per_agent_seconds = 2.5
 
-        def _render_into(slot, active_idx):
-            """Re-render the progress panel into the slot."""
-            slot.empty()
-            with slot:
+        # Demo log lines per agent (streamed in over time)
+        demo_logs = {
+            "Scanner": [
+                "Scanning Python source files…",
+                "Detected `torch.cuda.set_device(0)` at app.py:6",
+                "Detected `.cuda()` call at app.py:9",
+                "Detected `.cuda()` call at app.py:12",
+                "Detected import torchvision",
+                "Built dependency graph",
+                "Found 3 portability blockers",
+            ],
+            "Compatibility Analyst": [
+                "Loading ROCm risk registry…",
+                "Mapping CUDA risks → AMD/ROCm actions",
+                "Tagged `.cuda()` calls as severity=medium",
+                "Attached AMD fix hints (3 issues)",
+                "Risk profile complete",
+            ],
+            "ROCm Knowledge": [
+                "Querying local ROCm docs corpus…",
+                "Retrieved: torch.hip device guide",
+                "Retrieved: HIP runtime quickstart",
+                "Retrieved: device-agnostic patterns",
+                "Attached 4 source references",
+            ],
+            "Migration Engineer": [
+                "Loading deterministic migration rules…",
+                "Generating edit: replace `.cuda()` → `.to(device)`",
+                "Generating edit: device-agnostic device init",
+                "LLM fallback: 0 residual issues",
+                "Validating edits…",
+                "Patch generated (4 edits, 12 lines)",
+            ],
+            "QA Tester": [
+                "Connecting to AMD MI300X sandbox…",
+                "Uploading patched project via SCP",
+                "Running syntax check",
+                "Executing on ROCm runtime",
+                "Capturing rocm-smi metrics",
+                "Awaiting exit code…",
+            ],
+            "Report Writer": [
+                "Building markdown report…",
+                "Embedding scan findings",
+                "Embedding patch & QA results",
+                "Computing final readiness score",
+                "Report finalized (87 lines)",
+            ],
+        }
+
+        def render_progress(progress_per_agent, all_done):
+            """Re-render the parallel progress grid."""
+            progress_slot.empty()
+            with progress_slot:
                 cards_html = []
-                for i, name in enumerate(agent_names):
-                    state = agent_states[name]
-                    if state == "running":
-                        dot = "<span class='prog-dot prog-dot--running'></span>"
-                        card_cls = "prog-card prog-card--running"
-                        tag = "<span class='prog-tag prog-tag--running'>RUNNING</span>"
-                    elif state == "complete":
-                        dot = "<span class='prog-dot prog-dot--done'>&#10003;</span>"
-                        card_cls = "prog-card prog-card--done"
-                        tag = "<span class='prog-tag prog-tag--done'>DONE</span>"
-                    else:
-                        dot = "<span class='prog-dot prog-dot--idle'></span>"
-                        card_cls = "prog-card"
-                        tag = "<span class='prog-tag prog-tag--idle'>QUEUED</span>"
+                completed_count = 0
+                for name in agent_names:
+                    p = progress_per_agent[name]
+                    log_lines = demo_logs[name]
+                    visible = log_lines[: max(1, int(p * len(log_lines)))]
+                    is_done = p >= 1.0
+                    if is_done:
+                        completed_count += 1
+                    state_cls = "pp-card--done" if is_done else "pp-card--running"
+                    dot = "<span class='pp-dot pp-dot--done'>&#10003;</span>" if is_done else "<span class='pp-dot pp-dot--running'></span>"
+                    tag_cls = "pp-tag--done" if is_done else "pp-tag--running"
+                    tag_text = "COMPLETE" if is_done else "RUNNING"
+
+                    log_html = "".join(
+                        f"<div class='pp-log-line'>&gt; {html.escape(line)}</div>"
+                        for line in visible
+                    )
+
                     cards_html.append(
-                        f"<div class='{card_cls}'>"
-                        f"<div class='prog-card__head'>{dot}<div class='prog-card__name'>{name}</div>{tag}</div>"
-                        f"<div class='prog-card__desc'>{agent_descriptions[name]}</div>"
+                        f"<div class='pp-card {state_cls}'>"
+                        f"<div class='pp-card__head'>"
+                        f"{dot}"
+                        f"<div class='pp-card__name'>{html.escape(name)}</div>"
+                        f"<span class='pp-tag {tag_cls}'>{tag_text}</span>"
+                        f"</div>"
+                        f"<div class='pp-card__desc'>{html.escape(agent_descriptions[name])}</div>"
+                        f"<div class='pp-log'>{log_html}</div>"
                         f"</div>"
                     )
-                completed = sum(1 for n in agent_names if agent_states[n] == "complete")
-                pct = int((completed / len(agent_names)) * 100)
-                if agent_states[agent_names[active_idx]] == "running":
-                    pct = int(((completed + 0.5) / len(agent_names)) * 100)
+
+                pct = int((completed_count / len(agent_names)) * 100) if all_done else int(
+                    (sum(progress_per_agent.values()) / len(agent_names)) * 100
+                )
+                pct = min(100, max(0, pct))
+
                 st.markdown(
-                    "<div class='prog-panel'>"
-                    "<div class='prog-panel__title'>Multi-Agent Migration in Progress</div>"
-                    f"<div class='prog-panel__sub'>Step {active_idx + 1} of {len(agent_names)} &middot; {pct}%</div>"
-                    f"<div class='prog-bar'><div class='prog-bar__fill' style='width:{pct}%'></div></div>"
-                    f"<div class='prog-grid'>{''.join(cards_html)}</div>"
+                    "<div class='pp-panel'>"
+                    "<div class='pp-panel__head'>"
+                    "<div>"
+                    "<div class='pp-panel__kicker'>AMD &middot; MI300X &middot; Multi-Agent Orchestration</div>"
+                    "<div class='pp-panel__title'>Migration in Progress</div>"
+                    "</div>"
+                    f"<div class='pp-panel__pct'>{pct}%</div>"
+                    "</div>"
+                    f"<div class='pp-bar'><div class='pp-bar__fill' style='width:{pct}%'></div></div>"
+                    f"<div class='pp-grid'>{''.join(cards_html)}</div>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
 
-        for idx, name in enumerate(agent_names):
-            agent_states[name] = "running"
-            _render_into(progress_slot, idx)
-            elapsed = 0.0
-            tick = 0.25
-            while elapsed < per_agent_seconds:
-                if not worker.is_alive() and elapsed >= per_agent_seconds * 0.6:
-                    break
-                time.sleep(tick)
-                elapsed += tick
-            agent_states[name] = "complete"
-            _render_into(progress_slot, idx)
+        # Each agent has its own progress 0..1. Different speeds keep it lively.
+        agent_speeds = {
+            "Scanner": 0.10,
+            "Compatibility Analyst": 0.075,
+            "ROCm Knowledge": 0.06,
+            "Migration Engineer": 0.045,
+            "QA Tester": 0.035,
+            "Report Writer": 0.05,
+        }
+        progress_per_agent = {n: 0.0 for n in agent_names}
+
+        max_loops = 200
+        loop = 0
+        # Keep ticking until backend done AND all agents at 100%
+        while loop < max_loops:
+            for name in agent_names:
+                if progress_per_agent[name] < 1.0:
+                    progress_per_agent[name] = min(1.0, progress_per_agent[name] + agent_speeds[name])
+            render_progress(progress_per_agent, all_done=False)
+
+            backend_done = not worker.is_alive()
+            all_visible_done = all(p >= 1.0 for p in progress_per_agent.values())
+
+            if backend_done and all_visible_done:
+                break
+            if backend_done and loop > 8:
+                # Speed remaining agents to finish faster once backend is done
+                for n in agent_names:
+                    agent_speeds[n] = max(agent_speeds[n], 0.18)
+
+            time.sleep(0.35)
+            loop += 1
 
         worker.join()
+        # Final render at 100% for all
+        for n in agent_names:
+            progress_per_agent[n] = 1.0
+        render_progress(progress_per_agent, all_done=True)
+        time.sleep(0.4)
         progress_slot.empty()
 
         if "error" in error_holder:
@@ -1410,7 +1499,185 @@ def _dashboard_styles() -> str:
         pointer-events: auto;
     }
 
-    /* Live Progress Panel */
+    /* Parallel 6-Agent Progress Panel */
+    .pp-panel {
+        margin: 1.5rem auto 1rem;
+        padding: 1.5rem 1.5rem 1.7rem;
+        border-radius: 24px;
+        border: 1px solid rgba(255,255,255,0.06);
+        background: linear-gradient(180deg, rgba(20,20,28,0.85), rgba(15,15,22,0.9));
+    }
+
+    .pp-panel__head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1rem;
+        gap: 1rem;
+    }
+
+    .pp-panel__kicker {
+        font-size: 0.65rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(240,240,240,0.45);
+        margin-bottom: 0.3rem;
+    }
+
+    .pp-panel__title {
+        font-size: 1.4rem;
+        font-weight: 800;
+        color: #f0f0f0;
+        letter-spacing: -0.03em;
+    }
+
+    .pp-panel__pct {
+        font-size: 2rem;
+        font-weight: 900;
+        color: #ED1C24;
+        letter-spacing: -0.03em;
+    }
+
+    .pp-bar {
+        width: 100%;
+        height: 4px;
+        background: rgba(255,255,255,0.06);
+        border-radius: 999px;
+        overflow: hidden;
+        margin-bottom: 1.2rem;
+    }
+
+    .pp-bar__fill {
+        height: 100%;
+        background: linear-gradient(90deg, #ED1C24, #ff5050);
+        border-radius: 999px;
+        transition: width 0.4s ease;
+    }
+
+    .pp-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.8rem;
+    }
+
+    @media (max-width: 1100px) { .pp-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 700px) { .pp-grid { grid-template-columns: 1fr; } }
+
+    .pp-card {
+        padding: 0.9rem 1rem 1rem;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,0.07);
+        background: rgba(255,255,255,0.02);
+        display: flex;
+        flex-direction: column;
+        min-height: 200px;
+    }
+
+    .pp-card--running {
+        border-color: rgba(237,28,36,0.4);
+        background: rgba(237,28,36,0.04);
+        box-shadow: 0 0 30px rgba(237,28,36,0.08);
+    }
+
+    .pp-card--done {
+        border-color: rgba(34,197,94,0.25);
+        background: rgba(34,197,94,0.03);
+    }
+
+    .pp-card__head {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin-bottom: 0.4rem;
+    }
+
+    .pp-card__name {
+        flex: 1;
+        font-size: 0.92rem;
+        font-weight: 700;
+        color: #f0f0f0;
+    }
+
+    .pp-card__desc {
+        font-size: 0.72rem;
+        color: rgba(240,240,240,0.5);
+        line-height: 1.45;
+        margin-bottom: 0.6rem;
+    }
+
+    .pp-dot {
+        display: inline-grid;
+        place-items: center;
+        width: 0.95rem;
+        height: 0.95rem;
+        border-radius: 50%;
+        font-size: 0.65rem;
+        font-weight: 800;
+    }
+
+    .pp-dot--running {
+        background: #ED1C24;
+        animation: pp-pulse 1.2s ease-in-out infinite;
+    }
+
+    .pp-dot--done {
+        background: #22c55e;
+        color: #0a0a0a;
+    }
+
+    @keyframes pp-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(237,28,36,0.6); }
+        50% { box-shadow: 0 0 0 5px rgba(237,28,36,0); }
+    }
+
+    .pp-tag {
+        font-size: 0.6rem;
+        font-weight: 800;
+        letter-spacing: 0.16em;
+        padding: 0.22rem 0.55rem;
+        border-radius: 999px;
+        border: 1px solid;
+    }
+
+    .pp-tag--running {
+        color: #ED1C24;
+        border-color: rgba(237,28,36,0.4);
+        background: rgba(237,28,36,0.08);
+    }
+
+    .pp-tag--done {
+        color: #22c55e;
+        border-color: rgba(34,197,94,0.3);
+        background: rgba(34,197,94,0.05);
+    }
+
+    .pp-log {
+        flex: 1;
+        background: rgba(0,0,0,0.35);
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,0.04);
+        padding: 0.55rem 0.7rem;
+        font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+        font-size: 0.72rem;
+        color: #c8c8c8;
+        line-height: 1.55;
+        overflow-y: auto;
+        max-height: 130px;
+    }
+
+    .pp-log-line {
+        white-space: pre-wrap;
+        word-break: break-word;
+        opacity: 0;
+        animation: pp-fadein 0.3s ease forwards;
+    }
+
+    @keyframes pp-fadein {
+        from { opacity: 0; transform: translateY(2px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Legacy prog-* (still used elsewhere) */
     .prog-panel {
         max-width: 900px;
         margin: 4rem auto 2rem;

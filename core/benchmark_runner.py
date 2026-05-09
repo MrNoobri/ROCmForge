@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 _ENV_HOST = "AMD_SANDBOX_HOST"
 _ENV_USER = "AMD_SANDBOX_USER"
 _ENV_KEY_PATH = "AMD_SANDBOX_KEY_PATH"
+_ENV_KEY_PASSPHRASE = "AMD_SANDBOX_KEY_PASSPHRASE"
 _ENV_CONTAINER = "AMD_SANDBOX_CONTAINER"
 _TIMEOUT_DEFAULT = 120
 
@@ -108,6 +109,7 @@ def run_on_amd(
 
     user = _get_config(_ENV_USER, "root")
     key_path = _get_config(_ENV_KEY_PATH)
+    key_passphrase = _get_config(_ENV_KEY_PASSPHRASE)
 
     try:
         import paramiko
@@ -122,7 +124,31 @@ def run_on_amd(
 
     connect_kwargs: dict = {"hostname": host, "username": user, "timeout": 15}
     if key_path:
-        connect_kwargs["key_filename"] = str(Path(key_path).expanduser())
+        # Load encrypted private key explicitly so we can pass the passphrase.
+        if key_passphrase:
+            try:
+                resolved_key_path = str(Path(key_path).expanduser())
+                pkey = None
+                last_exc: Exception | None = None
+                for loader in (
+                    paramiko.Ed25519Key,
+                    paramiko.RSAKey,
+                    paramiko.ECDSAKey,
+                    paramiko.DSSKey,
+                ):
+                    try:
+                        pkey = loader.from_private_key_file(resolved_key_path, password=key_passphrase)
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+                if pkey is None:
+                    return _failed(f"Could not decrypt SSH key with provided passphrase: {last_exc}")
+                connect_kwargs["pkey"] = pkey
+            except Exception as exc:
+                return _failed(f"Failed to load SSH key: {exc}")
+        else:
+            connect_kwargs["key_filename"] = str(Path(key_path).expanduser())
 
     try:
         ssh.connect(**connect_kwargs)
