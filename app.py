@@ -141,49 +141,6 @@ def render_input_page() -> None:
                 st.rerun()
 
 
-def _render_progress_panel(slot, agent_names, agent_descriptions, states, active_idx):
-    """Renders the centered live-progress panel during a migration run."""
-    cards = []
-    for i, name in enumerate(agent_names):
-        state = states.get(name, "queued")
-        if state == "running":
-            dot = "<span class='prog-dot prog-dot--running'></span>"
-            card_cls = "prog-card prog-card--running"
-            tag = "<span class='prog-tag prog-tag--running'>RUNNING</span>"
-        elif state == "complete":
-            dot = "<span class='prog-dot prog-dot--done'>✓</span>"
-            card_cls = "prog-card prog-card--done"
-            tag = "<span class='prog-tag prog-tag--done'>DONE</span>"
-        else:
-            dot = "<span class='prog-dot prog-dot--idle'></span>"
-            card_cls = "prog-card"
-            tag = "<span class='prog-tag prog-tag--idle'>QUEUED</span>"
-        cards.append(f"""
-        <div class='{card_cls}'>
-            <div class='prog-card__head'>
-                {dot}
-                <div class='prog-card__name'>{name}</div>
-                {tag}
-            </div>
-            <div class='prog-card__desc'>{agent_descriptions[name]}</div>
-        </div>""")
-
-    progress_pct = int(((active_idx + (1 if states[agent_names[active_idx]] == "complete" else 0.5)) / len(agent_names)) * 100)
-    progress_pct = min(100, progress_pct)
-
-    panel_html = f"""
-    <div class='prog-panel'>
-        <div class='prog-panel__title'>Multi-Agent Migration in Progress</div>
-        <div class='prog-panel__sub'>Step {active_idx + 1} of {len(agent_names)} · {progress_pct}%</div>
-        <div class='prog-bar'><div class='prog-bar__fill' style='width:{progress_pct}%'></div></div>
-        <div class='prog-grid'>
-            {''.join(cards)}
-        </div>
-    </div>
-    """
-    slot.markdown(panel_html, unsafe_allow_html=True)
-
-
 def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> None:
     """Renders the active migration dashboard and the 6-agent tabbed view."""
     
@@ -229,30 +186,67 @@ def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> N
             pass
         worker.start()
 
-        # Visual progression: each agent shows running, then complete, in sequence.
-        center_col = st.empty()
+        # Live agent progression: each agent flips queued → running → done in sequence.
+        # Use a SINGLE container that we re-render into; never call .empty() on it
+        # mid-run (causes Streamlit to escape subsequent HTML).
+        progress_slot = st.container()
         agent_states = {name: "queued" for name in agent_names}
         per_agent_seconds = 2.5
 
+        def _render_into(slot, active_idx):
+            """Re-render the progress panel into the slot."""
+            slot.empty()
+            with slot:
+                cards_html = []
+                for i, name in enumerate(agent_names):
+                    state = agent_states[name]
+                    if state == "running":
+                        dot = "<span class='prog-dot prog-dot--running'></span>"
+                        card_cls = "prog-card prog-card--running"
+                        tag = "<span class='prog-tag prog-tag--running'>RUNNING</span>"
+                    elif state == "complete":
+                        dot = "<span class='prog-dot prog-dot--done'>&#10003;</span>"
+                        card_cls = "prog-card prog-card--done"
+                        tag = "<span class='prog-tag prog-tag--done'>DONE</span>"
+                    else:
+                        dot = "<span class='prog-dot prog-dot--idle'></span>"
+                        card_cls = "prog-card"
+                        tag = "<span class='prog-tag prog-tag--idle'>QUEUED</span>"
+                    cards_html.append(
+                        f"<div class='{card_cls}'>"
+                        f"<div class='prog-card__head'>{dot}<div class='prog-card__name'>{name}</div>{tag}</div>"
+                        f"<div class='prog-card__desc'>{agent_descriptions[name]}</div>"
+                        f"</div>"
+                    )
+                completed = sum(1 for n in agent_names if agent_states[n] == "complete")
+                pct = int((completed / len(agent_names)) * 100)
+                if agent_states[agent_names[active_idx]] == "running":
+                    pct = int(((completed + 0.5) / len(agent_names)) * 100)
+                st.markdown(
+                    "<div class='prog-panel'>"
+                    "<div class='prog-panel__title'>Multi-Agent Migration in Progress</div>"
+                    f"<div class='prog-panel__sub'>Step {active_idx + 1} of {len(agent_names)} &middot; {pct}%</div>"
+                    f"<div class='prog-bar'><div class='prog-bar__fill' style='width:{pct}%'></div></div>"
+                    f"<div class='prog-grid'>{''.join(cards_html)}</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
         for idx, name in enumerate(agent_names):
             agent_states[name] = "running"
-            _render_progress_panel(center_col, agent_names, agent_descriptions, agent_states, idx)
+            _render_into(progress_slot, idx)
             elapsed = 0.0
             tick = 0.25
             while elapsed < per_agent_seconds:
-                # If the worker is still running, we keep ticking
-                # If worker is done early and we're past 70% of allotted time, exit early
                 if not worker.is_alive() and elapsed >= per_agent_seconds * 0.6:
                     break
                 time.sleep(tick)
                 elapsed += tick
             agent_states[name] = "complete"
-            _render_progress_panel(center_col, agent_names, agent_descriptions, agent_states, idx)
+            _render_into(progress_slot, idx)
 
-        # Now wait for the real backend if it's still running
         worker.join()
-
-        center_col.empty()
+        progress_slot.empty()
 
         if "error" in error_holder:
             st.error(error_holder["error"])
@@ -311,78 +305,60 @@ def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> N
 
     results = st.session_state.results
 
-    # Full-width Migration output snapshot
-    with st.container(border=True):
-        st.markdown(_section_header("00", "Migration output snapshot", "Latest run artifacts and shortlog."), unsafe_allow_html=True)
-        if results:
-            runtime = results.get("benchmark", {}).get("after", {}).get("runtime", 0.0)
-            issues_count = len(results.get("issues", []))
-            artifacts = len(results.get("generated_files", []))
-            st.markdown(
-                f"""
-                <div class='hero-panel hero-panel--full' style='margin-bottom: 1rem;'>
-                    <div class='hero-panel__title'>
-                        <div>
-                            <div class='hero-panel__kicker'>Live posture</div>
-                            <div class='hero-panel__headline'>Migration output snapshot</div>
-                        </div>
-                        <span class='status-chip status-chip--complete'>Connected</span>
-                    </div>
-                    <div class='hero-panel__body'>A concise snapshot of the last migration run including readiness, issues, runtime, and generated artifacts.</div>
-                    <div class='hero-panel__stats'>
-                        <div class='hero-panel__stat'>
-                            <div class='hero-panel__stat-label'>Readiness</div>
-                            <div class='hero-panel__stat-value'>{results.get('readiness_score', 0)}/100</div>
-                        </div>
-                        <div class='hero-panel__stat'>
-                            <div class='hero-panel__stat-label'>Issues</div>
-                            <div class='hero-panel__stat-value'>{issues_count}</div>
-                        </div>
-                        <div class='hero-panel__stat'>
-                            <div class='hero-panel__stat-label'>Runtime</div>
-                            <div class='hero-panel__stat-value'>{runtime}s</div>
-                        </div>
-                        <div class='hero-panel__stat'>
-                            <div class='hero-panel__stat-label'>Artifacts</div>
-                            <div class='hero-panel__stat-value'>{artifacts}</div>
-                        </div>
-                    </div>
+    # AMD Ready banner with key stats (replaces splash + snapshot)
+    if results:
+        score_before = results.get("readiness_score", 0)
+        score_after = results.get("score_after", score_before)
+        improvement = max(0, score_after - score_before)
+        issues_count = len(results.get("issues", []))
+        applied_count = len(results.get("applied_edits", []))
+        qa_status = results.get("benchmark", {}).get("after", {}).get("status", "unknown")
+        runtime = results.get("benchmark", {}).get("after", {}).get("runtime", 0.0)
+        failure_class = results.get("failure_class", "unknown")
+
+        qa_color = "#22c55e" if qa_status == "passed" else "#ff4444"
+        qa_label = qa_status if qa_status != "failed" else f"failed · {failure_class}"
+
+        st.markdown(f"""
+        <div class='ready-banner'>
+            <div class='ready-banner__head'>
+                <div>
+                    <div class='ready-banner__kicker'>AMD MI300X &middot; Migration Complete</div>
+                    <div class='ready-banner__title'><span>AMD</span> Ready</div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            qa_status = results.get("benchmark", {}).get("after", {}).get("status", "unknown")
-            failure_class = results.get("failure_class", "unknown")
-
-            summary_cols = st.columns(4)
-            summary_cols[0].markdown(
-                _stat_card("Before Score", f"{results['readiness_score']}/100", "Static portability score before the patch.", tone="success"),
-                unsafe_allow_html=True,
-            )
-            summary_cols[1].markdown(
-                _stat_card("After Score", f"{results.get('score_after', 0)}/100", "Post-migration posture after QA and retry loops.", tone="primary"),
-                unsafe_allow_html=True,
-            )
-            summary_cols[2].markdown(
-                _stat_card("Issues Found", issues_count, "Detected CUDA, NVIDIA, and portability blockers.", tone="warning"),
-                unsafe_allow_html=True,
-            )
-            
-            qa_label = qa_status
-            if qa_status == "failed" and failure_class in ("app_bug", "environment"):
-                qa_label = f"{qa_status} ({failure_class})"
-            summary_cols[3].markdown(
-                _stat_card("AMD QA", qa_label, "Sandbox execution result for the patched project.", tone="crimson" if qa_status == "failed" else "primary"),
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info("No migration output yet.")
-
-    # Splash screen — shown once when results first arrive
-    if results and not st.session_state.get("splash_shown"):
-        st.session_state.splash_shown = True
-        _render_amd_splash(results)
+                <div class='ready-banner__improvement'>
+                    <div class='ready-banner__delta'>+{improvement} pts</div>
+                    <div class='ready-banner__delta-label'>Score Improvement</div>
+                </div>
+            </div>
+            <div class='ready-banner__stats'>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>Before Score</div>
+                    <div class='ready-stat__value'>{score_before}<span>/100</span></div>
+                </div>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>After Score</div>
+                    <div class='ready-stat__value' style='color:#5af07f;'>{score_after}<span>/100</span></div>
+                </div>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>Issues Found</div>
+                    <div class='ready-stat__value'>{issues_count}</div>
+                </div>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>Issues Fixed</div>
+                    <div class='ready-stat__value' style='color:#5af07f;'>{applied_count}</div>
+                </div>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>Runtime</div>
+                    <div class='ready-stat__value'>{runtime}<span>s</span></div>
+                </div>
+                <div class='ready-stat'>
+                    <div class='ready-stat__label'>AMD QA</div>
+                    <div class='ready-stat__value' style='color:{qa_color};font-size:1.2rem;'>{html.escape(qa_label)}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     # 2 Tab Navigation
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1265,6 +1241,123 @@ def _dashboard_styles() -> str:
     /* Push content below the top bar */
     main .block-container {
         padding-top: 5rem !important;
+    }
+
+    /* AMD Ready Banner */
+    .ready-banner {
+        margin-top: 2rem;
+        margin-bottom: 1.5rem;
+        padding: 2rem 2rem 1.7rem;
+        border-radius: 24px;
+        border: 1px solid rgba(237,28,36,0.25);
+        background: linear-gradient(135deg, rgba(20,20,28,0.95), rgba(15,15,22,0.95));
+        box-shadow: 0 0 60px rgba(237,28,36,0.08);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .ready-banner::before {
+        content: "";
+        position: absolute;
+        top: -100px;
+        right: -100px;
+        width: 300px;
+        height: 300px;
+        background: radial-gradient(circle, rgba(237,28,36,0.15), transparent 70%);
+        pointer-events: none;
+    }
+
+    .ready-banner__head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 2rem;
+        flex-wrap: wrap;
+        margin-bottom: 1.5rem;
+        position: relative;
+        z-index: 1;
+    }
+
+    .ready-banner__kicker {
+        font-size: 0.7rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(240,240,240,0.5);
+        margin-bottom: 0.3rem;
+    }
+
+    .ready-banner__title {
+        font-size: clamp(2rem, 4vw, 3.2rem);
+        font-weight: 900;
+        letter-spacing: -0.04em;
+        line-height: 1;
+        color: #f0f0f0;
+    }
+
+    .ready-banner__title span { color: #ED1C24; }
+
+    .ready-banner__improvement {
+        text-align: right;
+    }
+
+    .ready-banner__delta {
+        font-size: clamp(1.8rem, 3.5vw, 2.6rem);
+        font-weight: 900;
+        color: #ED1C24;
+        letter-spacing: -0.03em;
+        line-height: 1;
+    }
+
+    .ready-banner__delta-label {
+        font-size: 0.7rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(240,240,240,0.5);
+        margin-top: 0.4rem;
+    }
+
+    .ready-banner__stats {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 0.8rem;
+        position: relative;
+        z-index: 1;
+    }
+
+    @media (max-width: 1100px) {
+        .ready-banner__stats { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 600px) {
+        .ready-banner__stats { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    .ready-stat {
+        padding: 1rem 1.1rem;
+        border-radius: 14px;
+        background: rgba(255,255,255,0.025);
+        border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .ready-stat__label {
+        font-size: 0.65rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(240,240,240,0.45);
+        margin-bottom: 0.5rem;
+    }
+
+    .ready-stat__value {
+        font-size: 1.6rem;
+        font-weight: 800;
+        color: #f0f0f0;
+        letter-spacing: -0.03em;
+        line-height: 1;
+    }
+
+    .ready-stat__value span {
+        font-size: 0.85rem;
+        color: rgba(240,240,240,0.4);
+        font-weight: 500;
     }
 
     /* Colored Diff Block (Final Report > Code Diff tab) */
