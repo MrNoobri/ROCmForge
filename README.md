@@ -1,3 +1,14 @@
+---
+title: ROCmForge
+emoji: 🔥
+colorFrom: red
+colorTo: gray
+sdk: streamlit
+sdk_version: 1.39.0
+app_file: app.py
+pinned: false
+---
+
 # ROCmForge
 
 ROCmForge is a proof-backed multi-agent migration lab for moving CUDA-focused AI code toward AMD/ROCm compatibility.
