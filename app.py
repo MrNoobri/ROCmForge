@@ -100,45 +100,69 @@ def render_input_page() -> None:
 
     st.markdown("""
     <div class='landing-hero'>
-        <div>
-            <div class='landing-hero__kicker'>AMD · MI300X</div>
-            <h1 class='landing-hero__headline'>Port CUDA to ROCm.<br>Validated on real AMD silicon.</h1>
-            <p class='landing-hero__sub'>Six-agent pipeline. Deterministic rules + LLM fallback. Real GPU execution on AMD MI300X.</p>
-            <div class='landing-stats'>
-                <span class='landing-stat-pill landing-stat-pill--accent'>MI300X · 192GB HBM3</span>
-                <span class='landing-stat-pill'>Avg +40% throughput</span>
-                <span class='landing-stat-pill'>Real GPU validation</span>
-            </div>
+        <div class='landing-hero__kicker'>AMD · MI300X</div>
+        <h1 class='landing-hero__headline'>Port CUDA to ROCm.<br>Validated on real AMD silicon.</h1>
+        <p class='landing-hero__sub'>Six-agent pipeline. Deterministic rules + LLM fallback. Real GPU execution on AMD MI300X.</p>
+        <div class='landing-stats'>
+            <span class='landing-stat-pill landing-stat-pill--accent'>MI300X · 192GB HBM3</span>
+            <span class='landing-stat-pill'>Avg +40% throughput</span>
+            <span class='landing-stat-pill'>Real GPU validation</span>
         </div>
-        <div></div>
     </div>
     """, unsafe_allow_html=True)
 
-    with st.container(border=True):
-        st.markdown("<div style='padding-bottom: 0.4rem;'><div class='landing-hero__kicker' style='margin-bottom:0.75rem;'>Start Migration</div></div>", unsafe_allow_html=True)
+    sample_placeholder = (
+        "import torch\n"
+        "import torchvision\n"
+        "from torchvision import models\n"
+        "\n"
+        "def main():\n"
+        "    torch.cuda.set_device(0)\n"
+        "    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)\n"
+        "    model.eval()\n"
+        "    model.cuda()\n"
+        "    input_shape = (1, 3, 224, 224)\n"
+        "    x = torch.randn(input_shape)\n"
+        "    x = x.cuda()\n"
+        "    with torch.no_grad():\n"
+        "        y = model(x)\n"
+        "    print(y.shape)\n"
+        "\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
 
-        with st.form("migration_form", border=False):
-            col_url, col_code = st.columns(2)
-            with col_url:
+    _, form_center, _ = st.columns([1, 2, 1])
+    with form_center:
+        with st.container(border=True):
+            st.markdown("<div style='padding-bottom: 0.4rem;'><div class='landing-hero__kicker' style='margin-bottom:0.75rem;'>Start Migration</div></div>", unsafe_allow_html=True)
+
+            with st.form("migration_form", border=False):
                 github_url = st.text_input(
                     "GitHub URL",
                     placeholder="https://github.com/user/repo",
                 )
-            with col_code:
                 pasted_script = st.text_area(
                     "Paste a Python script",
+                    value=sample_placeholder,
                     height=180,
-                    placeholder="# or paste your CUDA code here...",
                 )
 
-            start_migration = st.form_submit_button("Migrate →", type="primary", use_container_width=True)
+                start_migration = st.form_submit_button("Migrate →", type="primary", use_container_width=True)
 
-            if start_migration:
-                st.session_state.input_script = pasted_script
-                st.session_state.input_url = github_url
-                st.session_state.migrating = True
-                st.session_state.run_started = False
-                st.rerun()
+                if start_migration:
+                    st.session_state.input_script = pasted_script
+                    st.session_state.input_url = github_url
+                    st.session_state.migrating = True
+                    st.session_state.run_started = False
+                    st.rerun()
+
+        st.markdown(
+            "<div style='text-align:center; margin-top:0.75rem; color:#9aa0a6; font-size:0.875rem;'>"
+            "Try a sample: <a href='https://github.com/MrNoobri/cuda-sample' target='_blank' style='color:#ed1c24; text-decoration:none;'>https://github.com/MrNoobri/cuda-sample</a>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_dashboard_page(agent_names: list[str], agent_descriptions: dict) -> None:
@@ -2609,15 +2633,12 @@ def _dashboard_styles() -> str:
 
     /* Landing Page Hero */
     .landing-hero {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 2rem;
+        display: flex;
+        flex-direction: column;
         align-items: center;
+        text-align: center;
+        gap: 0;
         padding: 2rem 0 1.5rem;
-    }
-
-    @media (max-width: 768px) {
-        .landing-hero { grid-template-columns: 1fr; }
     }
 
     .landing-hero__kicker {
@@ -2650,10 +2671,13 @@ def _dashboard_styles() -> str:
         font-size: 1rem;
         line-height: 1.65;
         max-width: 50ch;
+        margin-left: auto;
+        margin-right: auto;
         margin-bottom: 1.5rem;
     }
 
     .landing-stats {
+        justify-content: center;
         display: flex;
         gap: 0.65rem;
         flex-wrap: wrap;
