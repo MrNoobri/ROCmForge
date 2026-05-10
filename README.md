@@ -31,7 +31,7 @@ pinned: false
 - [Project Layout](#project-layout)
 - [Notes](#notes)
 
-## What It Does
+## What It Does 
 
 ROCmForge is built for the migration gap between CUDA-locked AI code and AMD hardware. It combines static scanning, local ROCm documentation retrieval, structured patch generation, sandbox execution, and benchmark reporting so teams can prove compatibility before deployment.
 
