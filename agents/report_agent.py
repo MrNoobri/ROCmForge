@@ -1,10 +1,45 @@
 """Report agent — assembles the final markdown migration report."""
 
+import os
+import tomllib
 from pathlib import Path
 
-from crewai import Agent
+from crewai import Agent, LLM
 
 OUTPUTS_DIR = Path(__file__).parent.parent / "outputs"
+
+
+def _get_config(key: str, default: str = "") -> str:
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+
+    secrets_path = Path(".streamlit") / "secrets.toml"
+    if secrets_path.exists():
+        try:
+            data = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
+            value = str(data.get(key, "")).strip()
+            if value:
+                return value
+        except Exception:
+            pass
+
+    return default
+
+
+def _normalize_model_name(model_name: str) -> str:
+    if "/" in model_name and model_name.split("/", 1)[0] in {"openai", "hosted_vllm"}:
+        return model_name
+    return f"hosted_vllm/{model_name}"
+
+
+def _build_llm() -> LLM:
+    return LLM(
+        model=_normalize_model_name(_get_config("VLLM_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")),
+        base_url=_get_config("VLLM_ENDPOINT_URL"),
+        api_key=_get_config("VLLM_API_KEY"),
+    )
+
 
 report_agent = Agent(
     role="Report Writer",
@@ -12,6 +47,7 @@ report_agent = Agent(
     backstory="You are a technical writer who summarises GPU migration results for engineering teams.",
     verbose=False,
     allow_delegation=False,
+    llm=_build_llm(),
 )
 
 
