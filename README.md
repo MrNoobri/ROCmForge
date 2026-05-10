@@ -147,14 +147,12 @@ Launch the app:
 streamlit run app.py
 ```
 
-### Optional Frontend Workspace
+### Frontend Workspace
 
-The `website/` folder contains the companion React/TanStack/Vite UI used for the dashboard experience.
+The `app.py` website contains the frontend UI used for the dashboard experience.
 
 ```powershell
-cd website
-bun install
-bun run dev
+streamlit run app.py
 ```
 
 ## Environment Variables
@@ -169,9 +167,6 @@ ROCmForge reads configuration from environment variables, `.env`, or `.streamlit
 | `AMD_SANDBOX_HOST` | Yes for live QA | SSH host for the AMD sandbox instance. |
 | `AMD_SANDBOX_USER` | No | SSH username, defaults to `root`. |
 | `AMD_SANDBOX_KEY_PATH` | Yes for live QA | Path to the SSH private key used by Paramiko. |
-| `AMD_SANDBOX_KEY_PASSPHRASE` | No | Passphrase for encrypted SSH keys. |
-| `AMD_SANDBOX_CONTAINER` | No | Optional container name used on the sandbox host. |
-| `DEFAULT_DEMO_MODE` | No | Controls whether the UI starts in cached demo mode. |
 
 Example `.streamlit/secrets.toml` values are provided in `.streamlit/secrets.toml.example`.
 
@@ -210,7 +205,6 @@ agents/                        # Scanner, compatibility, knowledge, migration, Q
 core/                          # Repo loading, scoring, patching, benchmarking, scanning
 docs_rag/                      # Local ROCm documentation corpus + retrieval helpers
 examples/broken_cuda_demo/     # Sample failing CUDA project
-website/                       # Companion React/Vite dashboard implementation
 ```
 
 ## Notes
